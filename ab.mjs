@@ -43,11 +43,18 @@ const REPO_DIR = path.dirname(fileURLToPath(import.meta.url));
 // Inside the repo, so results can be committed and the generated issue comment can link to them.
 const RESULTS_DIR = path.join(REPO_DIR, "results");
 const REPORTS_DIR = path.join(REPO_DIR, "reports");
+// `run --test` output checks the harness, not usage, so it goes to a gitignored folder.
+const TEST_RESULTS_DIR = path.join(REPO_DIR, "test-results");
 
 class Abort extends Error {}
 
 /** ISO 8601 UTC to the second, with ":" as "-" so it is a valid file name on every OS. */
 const fileStamp = (date = new Date()) => date.toISOString().replace(/\.\d+Z$/, "Z").replaceAll(":", "-");
+
+/** Path of a run's files without extension: `<dir>/<ISO time>-<kind>`, or `--out` with any extension dropped. */
+function resultsBase(out, kind, dir = RESULTS_DIR) {
+  return out ? path.resolve(out).replace(/\.(jsonl|md)$/, "") : path.join(dir, `${fileStamp()}-${kind}`);
+}
 
 /** Never overwrites: a name already taken (same second) gets a numeric suffix. */
 function freshPath(dir, base, ext) {
@@ -241,8 +248,22 @@ async function openProbe(claude) {
       stderr: () => {},
     },
   });
-  await q.initializationResult();
-  return { q, close: () => (input.end(), q.close()) };
+  const init = await q.initializationResult();
+  return { q, account: init.account ?? {}, close: () => (input.end(), q.close()) };
+}
+
+/** Who the CLI is logged in as. Shown before spending, never written to results, which get committed. */
+function describeAccount(account) {
+  const who = [account.email, account.organization].filter(Boolean).join(", ") || "unknown account";
+  return `${who} (config: ${anonymizePath(claudeHome())})`;
+}
+
+function describeReset(iso) {
+  if (!iso) return "";
+  const at = new Date(iso);
+  const minutes = Math.max(0, Math.round((at.getTime() - Date.now()) / 60_000));
+  const left = minutes >= 1440 ? `${Math.floor(minutes / 1440)}d ${Math.floor((minutes % 1440) / 60)}h` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+  return `, resets ${at.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })} (in ${left})`;
 }
 
 /** Starts every arm's process without sending a prompt, so a broken arm fails before anything is spent. */
@@ -291,6 +312,7 @@ async function readUsage(q) {
     fiveHour: fiveHour.utilization,
     fiveHourResetsAt: fiveHour.resets_at,
     sevenDay: usage.rate_limits.seven_day?.utilization ?? null,
+    sevenDayResetsAt: usage.rate_limits.seven_day?.resets_at ?? null,
     subscription: usage.subscription_type,
   };
 }
@@ -375,19 +397,20 @@ function findTranscript(sessionId) {
 
 const fmtTokens = (n) => (Math.abs(n) >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : `${(n / 1e3).toFixed(0)}k`);
 
+/** A run is one `.jsonl` data file and one `.md` report of the same name. Meta rows are appended; later ones win. */
 class Log {
-  constructor(dir) {
-    this.dir = dir;
-    this.file = path.join(dir, "samples.jsonl");
+  constructor(base) {
+    this.file = `${base}.jsonl`;
+    this.report = `${base}.md`;
     // Appending to an earlier run would mix two runs' data into one report.
-    if (fs.existsSync(this.file)) throw new Abort(`${dir} already holds a run. Choose a new --out.`);
-    fs.mkdirSync(dir, { recursive: true });
+    if (fs.existsSync(this.file)) throw new Abort(`${this.file} already holds a run. Choose a new --out.`);
+    fs.mkdirSync(path.dirname(base), { recursive: true });
   }
   write(row) {
     fs.appendFileSync(this.file, JSON.stringify(row) + "\n");
   }
   meta(value) {
-    fs.writeFileSync(path.join(this.dir, "meta.json"), JSON.stringify(value, null, 2) + "\n");
+    this.write({ kind: "meta", meta: value });
   }
 }
 
@@ -397,14 +420,14 @@ class Log {
  * moved, give or take one turn at each end, and no usage is spent waiting for a first tick.
  */
 async function runBlock({ log, block, arm, target, ctx }) {
-  const { opts, probe, start, workspace, prompts, claude, stopped } = ctx;
+  const { opts, probe, start, workspace, prompts, claude, stopped, stderrPath } = ctx;
   const session = openSession({
     cwd: workspace,
     model: opts.model,
     effort: opts.effort,
     claude,
     arm,
-    stderrPath: path.join(log.dir, "stderr.log"),
+    stderrPath,
   });
   try {
     await session.q.initializationResult();
@@ -428,7 +451,7 @@ async function runBlock({ log, block, arm, target, ctx }) {
         throw new Abort("The 5-hour window reset during the run. Start a new run early in a fresh window.");
       }
       const weighted = weigh(tokens);
-      log.write({ kind: "sample", block, arm, turn, weighted, costUsd, fiveHour: now.fiveHour, sevenDay: now.sevenDay, at: new Date().toISOString() });
+      log.write({ kind: "sample", block, arm, turn, tokens, weighted, costUsd, fiveHour: now.fiveHour, sevenDay: now.sevenDay, at: new Date().toISOString() });
       process.stdout.write(
         `\r[${block === 0 ? "warm-up" : `block ${block}`} ${arm}] turn ${turn}  5h ${now.fiveHour}% -> ${target}%  ${fmtTokens(weighted)} weighted  $${costUsd.toFixed(2)}   `,
       );
@@ -438,8 +461,19 @@ async function runBlock({ log, block, arm, target, ctx }) {
     }
     process.stdout.write("\n");
     const transcript = sessionId ? findTranscript(sessionId) : undefined;
-    const labels = transcript ? transcriptUsage([transcript]).entrypoints : [];
-    return { fiveHour: now.fiveHour, sevenDay: now.sevenDay, tokens, costUsd, turns: turn, labels, reached: now.fiveHour >= target };
+    // The transcript is a second client-side count. Model calls the CLI makes but never writes to it
+    // (compaction, for one) show up as a gap between the two.
+    const fromTranscript = transcript ? transcriptUsage([transcript]) : undefined;
+    return {
+      fiveHour: now.fiveHour,
+      sevenDay: now.sevenDay,
+      tokens,
+      transcriptTokens: fromTranscript?.total ?? null,
+      costUsd,
+      turns: turn,
+      labels: fromTranscript?.entrypoints ?? [],
+      reached: now.fiveHour >= target,
+    };
   } finally {
     session.close();
   }
@@ -457,24 +491,22 @@ function stats(values) {
   return { n, mean, sd, se, half: tCrit(n - 1) * se };
 }
 
-function loadResults(dirs) {
-  const runs = [];
-  for (const dir of dirs) {
-    const file = path.join(dir, "samples.jsonl");
-    if (!fs.existsSync(file)) throw new Error(`No samples.jsonl in ${dir}`);
-    const metaFile = path.join(dir, "meta.json");
-    const meta = fs.existsSync(metaFile) ? JSON.parse(fs.readFileSync(metaFile, "utf8")) : {};
+function loadResults(files) {
+  return files.map((file) => {
+    if (!fs.existsSync(file)) throw new Abort(`No such results file: ${file}`);
+    const run = path.basename(file, ".jsonl");
+    const meta = {};
     const spans = [];
     const tests = [];
     for (const line of fs.readFileSync(file, "utf8").split("\n")) {
       if (!line) continue;
       const row = JSON.parse(line);
-      if (row.kind === "span" && row.points > 0) spans.push({ ...row, run: path.basename(dir) });
+      if (row.kind === "meta") Object.assign(meta, row.meta);
+      if (row.kind === "span" && row.points > 0) spans.push({ ...row, run });
       if (row.kind === "test") tests.push(row);
     }
-    runs.push({ dir, meta, spans, tests });
-  }
-  return runs;
+    return { file, run, meta, spans, tests };
+  });
 }
 
 function analyze(runs) {
@@ -492,7 +524,10 @@ function analyze(runs) {
     const points = a.spans.reduce((sum, s) => sum + s.points, 0);
     const mix = emptyTokens();
     for (const s of a.spans) for (const k of Object.keys(mix)) mix[k] += s.tokens[k];
-    return { name, labels: [...a.labels], sources: [...a.sources], spans: a.spans, tokensPerPoint, costPerPoint, points, mix };
+    const checked = a.spans.filter((s) => s.transcriptTokens);
+    const sdk = checked.reduce((sum, s) => sum + weigh(s.tokens), 0);
+    const transcriptGap = checked.length ? (sdk - checked.reduce((sum, s) => sum + weigh(s.transcriptTokens), 0)) / sdk : undefined;
+    return { name, labels: [...a.labels], sources: [...a.sources], spans: a.spans, tokensPerPoint, costPerPoint, points, mix, transcriptGap };
   });
   if (arms.length === 0) return { arms, ref: undefined };
   // The reference is the arm whose window drains slowest, so every other ratio reads as "x times faster".
@@ -613,7 +648,7 @@ function bugReport(runs, file) {
     const m = run.meta;
     const env = m.environment ?? {};
     out.push(
-      `| Run \`${path.basename(run.dir)}\` | ${m.kind ?? "?"}${m.label ? ` (${m.label})` : ""}, ${m.startedAt ?? "?"} → ${m.finishedAt ?? "?"} |`,
+      `| Run \`${run.run}\` | ${m.kind ?? "?"}${m.label ? ` (${m.label})` : ""}, ${m.startedAt ?? "?"} → ${m.finishedAt ?? "?"} |`,
       `| Claude Code | ${env.claudeVersion ?? "?"} |`,
       `| Agent SDK | ${env.agentSdkVersion ?? "?"} |`,
       `| Plan | ${m.start?.subscription ?? "?"} |`,
@@ -642,13 +677,20 @@ function bugReport(runs, file) {
   );
   for (const a of arms) out.push(`- \`${a.name}\`: ${armMethod(a.name, a.sources)}`);
 
-  out.push("", "## Token mix per arm", "", "Same workload, so the mix should match across arms. A different mix would point at a client difference rather than metering.", "");
-  out.push("| Arm | Input | Cache write | Cache read | Output | Turns |", "|---|---|---|---|---|---|");
+  out.push(
+    "",
+    "## Token mix per arm",
+    "",
+    "Same workload, so the mix should match across arms. A different mix would point at a client difference rather than metering. The last column compares the SDK's usage count with the session transcript; a gap means model calls that are not written to the transcript.",
+    "",
+  );
+  out.push("| Arm | Input | Cache write | Cache read | Output | Turns | SDK count vs. transcript |", "|---|---|---|---|---|---|---|");
   for (const a of arms) {
     const total = a.mix.input + a.mix.cacheWrite + a.mix.cacheRead + a.mix.output;
     const pct = (v) => `${((100 * v) / total).toFixed(1)}%`;
     const turns = a.spans.reduce((sum, s) => sum + (s.turns ?? 0), 0);
-    out.push(`| ${a.name} | ${pct(a.mix.input)} | ${pct(a.mix.cacheWrite)} | ${pct(a.mix.cacheRead)} | ${pct(a.mix.output)} | ${turns || "–"} |`);
+    const gap = a.transcriptGap === undefined ? "–" : `${a.transcriptGap >= 0 ? "+" : ""}${(100 * a.transcriptGap).toFixed(1)}%`;
+    out.push(`| ${a.name} | ${pct(a.mix.input)} | ${pct(a.mix.cacheWrite)} | ${pct(a.mix.cacheRead)} | ${pct(a.mix.output)} | ${turns || "–"} | ${gap} |`);
   }
 
   out.push("", "## Blocks", "", "| Run | Block | Arm | Label | Points | Turns | Weighted tokens | List-price $ | Weighted tokens per point |", "|---|---|---|---|---|---|---|---|---|");
@@ -666,7 +708,7 @@ function bugReport(runs, file) {
     "- Arms labelled by this harness only emulate the client's label; a `watch` run of the real client checks the emulation.",
     "- Other usage on the account during the run inflates whichever arm was running. The operator kept the account otherwise idle.",
     "",
-    "Raw data: `samples.jsonl` (every turn and every block) and `meta.json` in each run folder.",
+    "Raw data: the `.jsonl` file of each run, next to its report, with every turn, every block and the run's metadata.",
     "",
     "## Issue comment",
     "",
@@ -699,16 +741,80 @@ function testReport(runs) {
   return lines.join("\n");
 }
 
+/** A meter point is a different number of tokens on each plan and model, so only those runs can be pooled. */
+const runGroup = (r) => (r.meta.kind === "run" ? `${r.meta.start?.subscription ?? "?"} / ${r.meta.model ?? "?"}` : undefined);
+const isComparable = (runs) => new Set(runs.map(runGroup).filter(Boolean)).size <= 1;
 const isTestOnly = (runs) => runs.every((r) => r.meta.test);
-const renderReport = (runs, file) => (isTestOnly(runs) ? testReport(runs) : bugReport(runs, file));
 
-/** Writes a new timestamped report into `dir`; returns its path and a short console summary. */
-function writeReport(dir, runs) {
-  fs.mkdirSync(dir, { recursive: true });
-  const file = freshPath(dir, `report-${fileStamp()}`, ".md");
-  const report = renderReport(runs, file);
+/** Runs that cannot be pooled: one row per run, each arm compared with that run's own slowest arm. */
+function collectedReport(runs, file) {
+  const rows = [];
+  const tally = new Map();
+  for (const run of runs.filter((r) => r.spans.length > 0)) {
+    const { arms, ref } = analyze([run]);
+    const m = run.meta;
+    const others = arms.filter((a) => a.ratio);
+    for (const a of others) {
+      const t = tally.get(a.name) ?? { runs: 0, faster: 0, ref: new Map() };
+      t.runs++;
+      if (!Number.isNaN(a.ratio.low) && a.ratio.low > 1) t.faster++;
+      t.ref.set(ref.name, (t.ref.get(ref.name) ?? 0) + 1);
+      tally.set(a.name, t);
+    }
+    rows.push(
+      `| ${run.run} | ${m.start?.subscription ?? "?"} | ${m.model ?? "set in client"} | ${m.environment?.claudeVersion ?? "?"} | \`${ref.name}\` | ${others.map((a) => `\`${a.name}\` ${fmtRatio(a.ratio)}`).join("; ") || "–"} |`,
+    );
+  }
+  const table = [
+    "| Run | Plan | Model | Claude Code | Slowest arm (reference) | Other arms: drain the window faster by (95% CI) |",
+    "|---|---|---|---|---|---|",
+    ...rows,
+  ];
+  const summary = [...tally].map(
+    ([name, t]) => `- \`${name}\` drained the window clearly faster than the run's slowest arm in ${t.faster} of ${t.runs} runs.`,
+  );
+  const comment = [
+    `Collected results from ${rows.length} runs of [claude-usage-ab](${REPO_URL}) across different plans or models. Each row compares the arms within one run.`,
+    "",
+    ...table,
+    "",
+    ...summary,
+    "",
+    `Full report: ${reportLink(file)}`,
+  ];
+  return [
+    "# Claude Code plan usage by entrypoint: collected results",
+    "",
+    `Generated ${new Date().toISOString()} by [claude-usage-ab](${REPO_URL}) for [anthropics/claude-code#97074](https://github.com/anthropics/claude-code/issues/97074).`,
+    "",
+    "These runs come from different plans or models. A point of the 5-hour window is a different number of tokens on each, so their blocks are not pooled. Each row is one run, with every arm compared against that run's slowest-draining arm. Each run's own report has the details.",
+    "",
+    ...table,
+    "",
+    ...summary,
+    "",
+    "## Issue comment",
+    "",
+    "Ready to paste into the issue:",
+    "",
+    "```markdown",
+    ...comment,
+    "```",
+  ].join("\n");
+}
+
+function renderReport(runs, file) {
+  if (isTestOnly(runs)) return { report: testReport(runs), pooled: false };
+  if (!isComparable(runs)) return { report: collectedReport(runs, file), pooled: false };
+  return { report: bugReport(runs, file), pooled: true };
+}
+
+/** Writes the report to `file`; returns a short console summary. */
+function writeReport(file, runs) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const { report, pooled } = renderReport(runs, file);
   fs.writeFileSync(file, report + "\n");
-  return { file, summary: isTestOnly(runs) ? report : armTable(analyze(runs)) };
+  return pooled ? armTable(analyze(runs)) : report;
 }
 
 const rotate = (list, by) => [...list.slice(by % list.length), ...list.slice(0, by % list.length)];
@@ -719,12 +825,13 @@ async function cmdRun(opts) {
   const arms = opts.arms.split(",").map((s) => s.trim()).filter(Boolean);
   // A test run checks the whole harness on a tiny corpus, two turns per arm, without waiting for meter ticks.
   if (opts.test) Object.assign(opts, { files: 2, lines: 20 });
-  const out = path.resolve(opts.out ?? path.join(RESULTS_DIR, `${fileStamp()}-${opts.test ? "test" : "run"}`));
+  const base = opts.test ? resultsBase(opts.out, "test", TEST_RESULTS_DIR) : resultsBase(opts.out, "run");
   const probe = await openProbe(claude);
   try {
     const start = await readUsage(probe.q);
     const environment = environmentInfo(claude);
     const plan = [
+      `Account: ${describeAccount(probe.account)}, ${start.subscription ?? "unknown"} plan`,
       `Claude binary: ${claude} (${environment.claudeVersion})`,
       `Model: ${opts.model}${opts.effort ? ` at ${opts.effort} effort` : ""}`,
       ...(opts.test
@@ -738,16 +845,19 @@ async function cmdRun(opts) {
             `Spend: about ${opts.budget + 1} points of your 5-hour window (now ${start.fiveHour}%), and the matching share of your weekly limit (now ${start.sevenDay}%).`,
             `Stops at ${opts.maxUtil}% (5-hour), ${opts.maxWeekly}% (weekly), on any sign of overage, or on Ctrl-C.`,
           ]),
-      `Results: ${out}`,
+      `Results: ${base}.md and ${base}.jsonl`,
     ];
     const needed = opts.test ? 1 : opts.budget + 1;
     if (start.fiveHour + needed > opts.maxUtil) {
       throw new Abort(`Not enough room: ${start.fiveHour}% + ${needed} points would pass --max-util ${opts.maxUtil}%. Wait for the window to reset.`);
     }
-    const log = new Log(out);
-    const workspace = path.join(out, "workspace");
+    const log = new Log(base);
+    // The corpus and Claude's stderr are scratch, so they stay out of the results that get committed.
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "claude-usage-ab-"));
+    const workspace = path.join(scratch, "workspace");
+    const stderrPath = path.join(scratch, "stderr.log");
     const prompts = prepareWorkspace(workspace, opts);
-    await preflight({ arms, claude, opts, cwd: workspace, stderrPath: path.join(out, "stderr.log") });
+    await preflight({ arms, claude, opts, cwd: workspace, stderrPath });
     await confirmSpend(plan, opts);
 
     const meta = {
@@ -771,7 +881,7 @@ async function cmdRun(opts) {
       meta.stopReason = "interrupted";
       console.log("\nStopping after this turn...");
     });
-    const ctx = { opts, probe, start, workspace, claude, prompts, stopped: () => stop };
+    const ctx = { opts, probe, start, workspace, claude, prompts, stderrPath, stopped: () => stop };
     try {
       if (opts.test) {
         for (const arm of arms) {
@@ -804,24 +914,36 @@ async function cmdRun(opts) {
             break;
           }
           const points = result.fiveHour - boundary;
-          log.write({ kind: "span", source: "scripted", block, arm, points, tokens: result.tokens, costUsd: result.costUsd, turns: result.turns, labels: result.labels });
+          log.write({
+            kind: "span",
+            source: "scripted",
+            block,
+            arm,
+            points,
+            tokens: result.tokens,
+            transcriptTokens: result.transcriptTokens,
+            costUsd: result.costUsd,
+            turns: result.turns,
+            labels: result.labels,
+          });
           measured += points;
           boundary = result.fiveHour;
           if (result.fiveHour >= opts.maxUtil) (meta.stopReason = "5-hour ceiling reached"), (stop = true);
           if (result.sevenDay != null && result.sevenDay >= opts.maxWeekly) (meta.stopReason = "weekly ceiling reached"), (stop = true);
         }
-        console.log(`\nAfter round ${round + 1} (${measured}/${opts.budget} points measured):\n${armTable(analyze(loadResults([out])))}\n`);
+        console.log(`\nAfter round ${round + 1} (${measured}/${opts.budget} points measured):\n${armTable(analyze(loadResults([log.file])))}\n`);
       }
       if (meta.stopReason === "running") meta.stopReason = "budget measured";
     } catch (error) {
       meta.stopReason = `error: ${error?.message ?? error}`;
+      console.error(`Claude's stderr: ${stderrPath}`);
       throw error;
     } finally {
       meta.finishedAt = new Date().toISOString();
       meta.end = await readUsage(probe.q).catch(() => null);
       log.meta(meta);
-      const { file, summary } = writeReport(out, loadResults([out]));
-      console.log(`\n${summary}\n\n${opts.test ? "Test report" : "Issue-ready report, including a comment to paste"}: ${file}`);
+      const summary = writeReport(log.report, loadResults([log.file]));
+      console.log(`\n${summary}\n\n${opts.test ? "Test report" : "Issue-ready report, including a comment to paste"}: ${log.report}`);
     }
   } finally {
     probe.close();
@@ -834,8 +956,7 @@ async function cmdWatch(workspace, opts) {
   // Claude Code stores a project's transcripts under its path with every non-alphanumeric character as "-".
   const projectDir = path.join(claudeHome(), "projects", abs.replace(/[^a-zA-Z0-9]/g, "-"));
   const label = opts.label ?? "manual";
-  const out = path.resolve(opts.out ?? path.join(RESULTS_DIR, `${fileStamp()}-${label}`));
-  const log = new Log(out);
+  const log = new Log(resultsBase(opts.out, label));
   const claude = resolveClaude(opts.claude);
   const probe = await openProbe(claude);
   const tokensNow = () => transcriptUsage(listJsonl(projectDir));
@@ -846,6 +967,7 @@ async function cmdWatch(workspace, opts) {
     const start = await readUsage(probe.q);
     meta.start = start;
     log.meta(meta);
+    console.log(`Account: ${describeAccount(probe.account)}, ${start.subscription ?? "unknown"} plan`);
     console.log(`Watching ${projectDir}`);
     console.log(`5-hour window at ${start.fiveHour}%. Send the prompts from ${path.join(abs, "prompts.txt")} one at a time.`);
     console.log("Every prompt you send spends real plan usage. Ctrl-C stops watching and writes the report.");
@@ -859,7 +981,7 @@ async function cmdWatch(workspace, opts) {
       const now = await readUsage(probe.q);
       if (!sameWindow(start.fiveHourResetsAt, now.fiveHourResetsAt)) throw new Abort("The 5-hour window reset. Start again.");
       const { total, entrypoints } = tokensNow();
-      log.write({ kind: "sample", block, arm: label, weighted: weigh(total), fiveHour: now.fiveHour, sevenDay: now.sevenDay, at: new Date().toISOString() });
+      log.write({ kind: "sample", block, arm: label, tokens: total, weighted: weigh(total), fiveHour: now.fiveHour, sevenDay: now.sevenDay, at: new Date().toISOString() });
       if (boundary === undefined) {
         if (now.fiveHour > start.fiveHour) {
           boundary = now.fiveHour;
@@ -894,8 +1016,8 @@ async function cmdWatch(workspace, opts) {
     meta.end = await readUsage(probe.q).catch(() => null);
     probe.close();
     log.meta(meta);
-    const { file, summary } = writeReport(out, loadResults([out]));
-    console.log(`\n${summary}\n\nIssue-ready report, including a comment to paste: ${file}`);
+    const summary = writeReport(log.report, loadResults([log.file]));
+    console.log(`\n${summary}\n\nIssue-ready report, including a comment to paste: ${log.report}`);
   }
 }
 
@@ -908,18 +1030,29 @@ async function cmdPrepare(dir, opts) {
 }
 
 async function cmdProbe(opts) {
-  const probe = await openProbe(resolveClaude(opts.claude));
+  const claude = resolveClaude(opts.claude);
+  const probe = await openProbe(claude);
   try {
-    console.log(await readUsage(probe.q));
+    const usage = await readUsage(probe.q);
+    console.log(
+      [
+        `Account:      ${describeAccount(probe.account)}`,
+        `Plan:         ${usage.subscription ?? probe.account.subscriptionType ?? "unknown"}`,
+        `Claude Code:  ${environmentInfo(claude).claudeVersion} (${claude})`,
+        `5-hour usage: ${usage.fiveHour}% used${describeReset(usage.fiveHourResetsAt)}`,
+        `Weekly usage: ${usage.sevenDay ?? "?"}% used${describeReset(usage.sevenDayResetsAt)}`,
+      ].join("\n"),
+    );
   } finally {
     probe.close();
   }
 }
 
-function cmdReport(dirs, opts) {
-  if (dirs.length === 0) throw new Abort("Usage: ab.mjs report <result dirs...> [--out <folder>]");
-  const runs = loadResults(dirs.map((d) => path.resolve(d)));
-  const { file } = writeReport(path.resolve(opts.out ?? REPORTS_DIR), runs);
+function cmdReport(files, opts) {
+  if (files.length === 0) throw new Abort("Usage: ab.mjs report <results .jsonl files...> [--out <folder>]");
+  const runs = loadResults(files.map((f) => path.resolve(f)));
+  const file = freshPath(path.resolve(opts.out ?? REPORTS_DIR), `report-${fileStamp()}`, ".md");
+  writeReport(file, runs);
   console.log(`Wrote ${file}`);
 }
 
@@ -965,7 +1098,7 @@ try {
   else if (command === "report") cmdReport(rest, opts);
   else {
     console.log(
-      "Commands: probe | run --model <id> [--test] | prepare <dir> | watch <dir> --label <client> | report <result dirs...>\nCommands that spend usage ask for confirmation; --yes skips the question.",
+      "Commands: probe | run --model <id> [--test] | prepare <dir> | watch <dir> --label <client> | report <results .jsonl files...>\nCommands that spend usage ask for confirmation; --yes skips the question.",
     );
     process.exitCode = 1;
   }

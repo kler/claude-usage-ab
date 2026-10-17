@@ -1,6 +1,6 @@
 # claude-usage-ab
 
-A test harness that measures whether Claude Code's 5-hour plan window drains faster per token depending on which client launched it. Background: [anthropics/claude-code#97074](https://github.com/anthropics/claude-code/issues/97074). Repository: https://github.com/kler/claude-usage-ab
+A test harness that measures whether Claude Code's 5-hour plan window drains faster per token depending on which client launched it. Background: [anthropics/claude-code#97074](https://github.com/anthropics/claude-code/issues/97074).
 
 It compares three ways of running the same Claude Code session:
 
@@ -10,7 +10,7 @@ It compares three ways of running the same Claude Code session:
 | `sdk-cli` | The same launch plus `-p` and no label, so the CLI labels itself. This is what `claude -p --input-format stream-json` does. | `sdk-cli` |
 | `claude-vscode` | The same launch with `CLAUDE_CODE_ENTRYPOINT=claude-vscode`, emulating the VS Code extension. | `claude-vscode` |
 
-The output is a Markdown report you can paste into the issue.
+Each run produces a Markdown report with a ready-to-paste issue comment. **Please contribute your reports**: results from many plans, models and machines are what make the answer convincing. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Why the arms are comparable
 
@@ -26,7 +26,12 @@ The `claude-vscode` arm only emulates the label. A `watch` run of the real exten
 
 ## How it measures
 
-**Meter.** A separate session that never sends a prompt reads the 5-hour utilization through the SDK's usage call. This costs no tokens, unlike a probe prompt.
+Each measurement pairs two numbers from two different sources:
+
+- **Tokens come from the client.** For scripted arms, the SDK's per-model usage for the session. As a cross-check, the session's transcript count is stored too: model calls the CLI makes without writing them to the transcript would show up as a gap. For `watch`, tokens come from the client's transcripts.
+- **Usage comes from the account.** The plan meter is the only place the account's response to those tokens can be seen, and it is account-wide: there is no per-session or per-client meter. A separate session that never sends a prompt reads it after every turn through the SDK's usage call, which costs no tokens.
+
+Both are stored for every turn.
 
 **Blocks.**
 - A block runs one arm in a fresh session. The session reads a generated text corpus once, then answers one-word questions about it. Most of each turn's tokens are cache reads, as in real agent use.
@@ -39,10 +44,10 @@ The `claude-vscode` arm only emulates the label. A `watch` run of the real exten
 
 ## Safety
 
-- `run` sends real prompts and spends real plan usage. It shows what it will spend and asks you to type `yes`. `--yes` (`-y`) skips the question, for scripted use.
+- `run` sends real prompts and spends real plan usage. It shows the account, plan and expected spend, and asks you to type `yes`. `--yes` (`-y`) skips the question, for scripted use.
 - Before asking, it starts every arm without a prompt, so a broken setup fails before anything is spent.
 - It stops on any sign of overage or a rejected request, at `--max-util` (5-hour, default 85%), at `--max-weekly` (default 95%), on Ctrl-C, or if the 5-hour window resets mid-run.
-- **Nothing else may use the account while it runs**, on any device. That includes AI coding sessions such as the one you may have used to set this up. Any other usage is counted against whichever arm was running.
+- **Nothing else may use the account while it runs**, on any device. Because the meter is account-wide, other usage (including an AI coding session you used to set this up) is counted against whichever arm was running. Rotation turns that into noise rather than a skew toward one arm, but it widens the intervals; such blocks show up as outliers in the report's block table.
 
 ## Use
 
@@ -50,16 +55,18 @@ Requires Node 20+ and a Claude Code login with a claude.ai subscription. Unset `
 
 ```sh
 npm install
-node ab.mjs probe                                      # read the meter; costs nothing
+node ab.mjs probe                                      # account, plan and meter; costs nothing
 node ab.mjs run --test --model claude-haiku-5-5        # check everything works; a small fraction of a point
 node ab.mjs run --model claude-opus-5-5 --effort high  # the measurement; about --budget + 1 points
 ```
+
+`probe` shows which account the CLI is logged in as. If you use several accounts, run it first: the harness uses whatever account `claude` uses, including any `CLAUDE_CONFIG_DIR` you set.
 
 To match the real VS Code extension exactly, pass its bundled binary to every command with `--claude`, for example `~/.vscode/extensions/anthropic.claude-code-2.1.301-darwin-arm64/resources/native-binary/claude`.
 
 ### `run --test`
 
-Runs every arm for two short turns on a tiny corpus. It goes through the whole pipeline: launch, meter, labels, logs and report. It doesn't wait for meter ticks, so it measures nothing. Use a small model.
+Runs every arm for two short turns on a tiny corpus. It goes through the whole pipeline: launch, meter, labels, logs and report. It doesn't wait for meter ticks, so it measures nothing. Use a small model. Its output goes to `test-results/`, which git ignores.
 
 ### `run` options
 
@@ -73,7 +80,7 @@ Runs every arm for two short turns on a tiny corpus. It goes through the whole p
 | `--files`, `--lines` | `8`, `1000` | Corpus size, about 100k tokens of context. Larger means fewer, bigger turns per point (faster, coarser). Keep it well under the context window so auto-compaction never runs. |
 | `--max-util`, `--max-weekly` | `85`, `95` | Stop ceilings in percent. |
 | `--claude` | `claude` on PATH | The Claude Code binary every arm uses. |
-| `--out` | `results/<timestamp>-run` | Results folder. A folder that already holds a run is refused. |
+| `--out` | `results/<time>-run` | Where to write the run's `.jsonl` and `.md`, without extension. An existing run is refused. |
 | `--yes`, `-y` | off | Skip the confirmation question. |
 
 ## Checking against a real client
@@ -91,26 +98,25 @@ node ab.mjs watch ws-vscode --label vscode-real
 
 The same works for any client that runs Claude Code in a folder, such as an Agent SDK app; give it its own `--label`.
 
-## Reports
+## Results and reports
 
-Every `run` and `watch` writes a folder under `results/` named with the UTC start time, for example `results/2026-10-17T10-30-00Z-run/`. Times use ISO 8601 with `-` in place of `:` so they are valid file names everywhere. The folder contains:
+Every `run` and `watch` writes two files under `results/`, named with the UTC start time:
 
-- `report-<time>.md`: the report for the issue. It has the result with confidence intervals, environment, method, how each arm was launched, token mix per arm, every block and caveats. At the end is an **issue comment** filled in from the results and linking to the report in this repository, ready to paste.
-- `samples.jsonl`: every turn and every block.
-- `meta.json`: versions, plan, meter readings at start and end, and the stop reason.
+- `results/2026-10-17T10-30-00Z-run.md`: the report. It has the result with confidence intervals, environment, method, how each arm was launched, token mix per arm, every block and caveats. It ends with an **issue comment** filled in from the results and linking to the report in this repository, ready to paste.
+- `results/2026-10-17T10-30-00Z-run.jsonl`: the raw data. Every turn and every block with both token counts and the meter readings, plus the run's metadata: versions, plan, model, meter at start and end, stop reason.
 
-Reports are never overwritten. Each `report` call writes a new file with its own timestamp.
+Times are ISO 8601 with `-` in place of `:`, so they are valid file names everywhere. The generated corpus and Claude's stderr go to a temporary folder, not the repo.
 
-To combine runs, for example a scripted run with real-client checks:
+To combine runs:
 
 ```sh
-node ab.mjs report results/<run> results/<vscode-real>   # writes reports/report-<time>.md
+node ab.mjs report results/<run>.jsonl results/<vscode-real>.jsonl   # writes reports/report-<time>.md
 ```
+
+Runs on the same plan and model are pooled. Runs from different plans or models are not, because a point of the 5-hour window is a different number of tokens on each. The report then shows one row per run, each compared against its own slowest arm, and counts in how many runs each arm drained faster. Reports are never overwritten: every `report` call writes a new file.
 
 The report states which labels were set by this harness. Keep that line when you post the results.
 
-## Sharing results
+## Privacy
 
-Results are meant to be committed, so the issue comment can link to them. Commit the run folder (and any combined report under `reports/`), then push before posting the comment. The generated corpus and `stderr.log` stay out of git.
-
-Committed files hold no names or home-directory paths, but your git commit records your git author identity.
+Results hold no account email, names or home-directory paths. They do record the plan type, model, Claude Code and SDK versions, OS and Node version. A pull request also shows your GitHub account, and commits show your git author name and email.

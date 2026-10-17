@@ -1,5 +1,4 @@
 node_modules/
-results/*/workspace/
-results/*/stderr.log
+test-results/
 ws-*/
 .DS_Store
