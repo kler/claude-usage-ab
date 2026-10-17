@@ -1,0 +1,4 @@
+node_modules/
+results/
+ws-*/
+.DS_Store

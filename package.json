@@ -1,0 +1,13 @@
+{
+  "name": "claude-usage-ab",
+  "private": true,
+  "type": "module",
+  "description": "A/B test: does Claude Code's 5-hour usage window drain faster per token depending on the client entrypoint?",
+  "bin": "./ab.mjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.276"
+  }
+}
