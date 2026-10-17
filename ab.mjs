@@ -819,7 +819,7 @@ function bugReport(runs) {
   const out = [
     "# Claude Code plan usage by entrypoint: A/B results",
     "",
-    `Generated ${new Date().toISOString()} by [claude-usage-ab](${REPO_URL}) for [anthropics/claude-code#97074](https://github.com/anthropics/claude-code/issues/97074).`,
+    `Generated ${new Date().toISOString()} by [claude-usage-ab](${REPO_URL}) ${describeHarness(harnessInfo(), { link: true })} for [anthropics/claude-code#97074](https://github.com/anthropics/claude-code/issues/97074).`,
     "",
   ];
   if (arms.length === 0) return out.concat("No complete measurements yet.").join("\n");
@@ -924,7 +924,7 @@ function testReport(runs) {
   const lines = [
     "# Harness test (not a measurement)",
     "",
-    `Generated ${new Date().toISOString()} by [claude-usage-ab](${REPO_URL}).`,
+    `Generated ${new Date().toISOString()} by [claude-usage-ab](${REPO_URL}) ${describeHarness(harnessInfo(), { link: true })}.`,
     "",
     "Each arm ran two short turns on a tiny corpus. This checks that every arm starts, gets its expected label and is metered; it says nothing about relative usage.",
     "",
@@ -987,7 +987,7 @@ function collectedReport(runs) {
   return [
     "# Claude Code plan usage by entrypoint: collected results",
     "",
-    `Generated ${new Date().toISOString()} by [claude-usage-ab](${REPO_URL}) for [anthropics/claude-code#97074](https://github.com/anthropics/claude-code/issues/97074).`,
+    `Generated ${new Date().toISOString()} by [claude-usage-ab](${REPO_URL}) ${describeHarness(harnessInfo(), { link: true })} for [anthropics/claude-code#97074](https://github.com/anthropics/claude-code/issues/97074).`,
     "",
     "These runs come from different plans or models. A point of the 5-hour window is a different number of tokens on each, so their blocks are not pooled. Each row is one run, with every arm compared against that run's slowest-draining arm. Each run's own report has the details.",
     "",
