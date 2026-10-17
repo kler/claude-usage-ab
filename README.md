@@ -120,7 +120,7 @@ The report states which labels were set by this harness. Keep that line when you
 
 ## Versions
 
-Every result records how it was produced: the harness version (`package.json`), the git commit, whether the harness files had local changes (with a hash of the script that ran), the exact command, every setting including defaults, and the meter method. The report shows all of it. Runs recorded before 0.2.0 show the harness as unknown and are never pooled with later ones, because they read the meter through a long-lived session.
+Every result records how it was produced: the claude-usage-ab version (`package.json`, also shown by `node ab.mjs --version`), the git commit, whether the harness files had local changes (with a hash of the script that ran), the exact command, every setting including defaults, and the meter method. The report shows all of it. Runs recorded before 0.2.0 show the harness as unknown and are never pooled with later ones, because they read the meter through a long-lived session.
 
 ## Privacy
 

@@ -594,11 +594,11 @@ function analyze(runs) {
 const setting = (m, key) => m.settings?.[key] ?? m[key] ?? m.corpus?.[key];
 
 /** "0.2.0 @ abc1234", flagged when the harness had local changes; old runs predate versioning. */
-function describeHarness(h, { link = false } = {}) {
+function describeHarness(h, { link = false, plain = false } = {}) {
   if (!h) return "unknown (recorded before 0.2.0)";
   const short = h.commit ? h.commit.slice(0, 7) : "no git";
   const commit = link && h.commit && !h.modified ? `[${short}](${REPO_URL}/commit/${h.commit})` : short;
-  const changes = h.modified ? `, **with local changes** (script sha256 ${h.scriptSha256.slice(0, 12)})` : "";
+  const changes = h.modified ? `, ${plain ? "with local changes" : "**with local changes**"} (script sha256 ${h.scriptSha256.slice(0, 12)})` : "";
   return `${h.version} @ ${commit}${changes}`;
 }
 
@@ -712,7 +712,7 @@ function bugReport(runs, file) {
     const env = m.environment ?? {};
     out.push(
       `| Run \`${run.run}\` | ${m.kind ?? "?"}${m.label ? ` (${m.label})` : ""}, ${m.startedAt ?? "?"} → ${m.finishedAt ?? "?"} |`,
-      `| Harness | ${describeHarness(m.harness, { link: true })} |`,
+      `| claude-usage-ab | ${describeHarness(m.harness, { link: true })} |`,
       `| Command | ${m.command ? `\`${m.command}\`` : "?"} |`,
       `| Settings | ${m.settings ? Object.entries(m.settings).map(([k, v]) => `${k} ${Array.isArray(v) ? v.join(",") : v}`).join(", ") : "?"} |`,
       `| Meter | ${m.meter ?? "long-lived CLI session (usage cached about 60 s)"} |`,
@@ -810,7 +810,7 @@ function testReport(runs) {
     lines.push(`| ${t.arm} | ${t.labels.join(", ") || "none"} | ${t.turns} | ${fmtTokens(weigh(t.tokens))} | ${t.costUsd.toFixed(3)} | ${t.fiveHour}% |`);
   }
   const m = runs[0]?.meta;
-  if (m) lines.push("", `Harness ${describeHarness(m.harness)}. Command: \`${m.command ?? "?"}\``);
+  if (m) lines.push("", `claude-usage-ab ${describeHarness(m.harness)}. Command: \`${m.command ?? "?"}\``);
   if (m?.start) lines.push("", `5-hour meter ${m.start.fiveHour}% → ${m.end?.fiveHour ?? "?"}%, weekly ${m.start.sevenDay}% → ${m.end?.sevenDay ?? "?"}%.`);
   return lines.join("\n");
 }
@@ -841,7 +841,7 @@ function collectedReport(runs, file) {
     );
   }
   const table = [
-    "| Run | Harness | Plan | Model | Claude Code | Slowest arm (reference) | Other arms: drain the window faster by (95% CI) |",
+    "| Run | claude-usage-ab | Plan | Model | Claude Code | Slowest arm (reference) | Other arms: drain the window faster by (95% CI) |",
     "|---|---|---|---|---|---|---|",
     ...rows,
   ];
@@ -906,6 +906,7 @@ async function cmdRun(opts) {
     const start = await meter.read();
     const environment = environmentInfo(claude);
     const plan = [
+      `claude-usage-ab: ${describeHarness(harnessInfo(), { plain: true })}`,
       `Account: ${describeAccount(meter.account)}, ${start.subscription ?? "unknown"} plan`,
       `Claude binary: ${claude} (${environment.claudeVersion})`,
       `Model: ${opts.model}${opts.effort ? ` at ${opts.effort} effort` : ""}`,
@@ -1070,6 +1071,7 @@ async function cmdWatch(workspace, opts) {
     const start = await meter.read();
     meta.start = start;
     log.meta(meta);
+    console.log(`claude-usage-ab: ${describeHarness(meta.harness, { plain: true })}`);
     console.log(`Account: ${describeAccount(meter.account)}, ${start.subscription ?? "unknown"} plan`);
     console.log(`Watching ${projectDir}`);
     console.log(`5-hour window at ${start.fiveHour}%. Send the prompts from ${path.join(abs, "prompts.txt")} one at a time.`);
@@ -1139,11 +1141,12 @@ async function cmdProbe(opts) {
     const usage = await readUsage(probe.q);
     console.log(
       [
-        `Account:      ${describeAccount(probe.account)}`,
-        `Plan:         ${usage.subscription ?? probe.account.subscriptionType ?? "unknown"}`,
-        `Claude Code:  ${environmentInfo(claude).claudeVersion} (${claude})`,
-        `5-hour usage: ${usage.fiveHour}% used${describeReset(usage.fiveHourResetsAt)}`,
-        `Weekly usage: ${usage.sevenDay ?? "?"}% used${describeReset(usage.sevenDayResetsAt)}`,
+        `claude-usage-ab: ${describeHarness(harnessInfo(), { plain: true })}`,
+        `Account:         ${describeAccount(probe.account)}`,
+        `Plan:            ${usage.subscription ?? probe.account.subscriptionType ?? "unknown"}`,
+        `Claude Code:     ${environmentInfo(claude).claudeVersion} (${claude})`,
+        `5-hour usage:    ${usage.fiveHour}% used${describeReset(usage.fiveHourResetsAt)}`,
+        `Weekly usage:    ${usage.sevenDay ?? "?"}% used${describeReset(usage.sevenDayResetsAt)}`,
       ].join("\n"),
     );
   } finally {
@@ -1177,6 +1180,7 @@ const { values, positionals } = parseArgs({
     label: { type: "string" },
     out: { type: "string" },
     yes: { type: "boolean", short: "y", default: false },
+    version: { type: "boolean", short: "v", default: false },
     test: { type: "boolean", default: false },
   },
 });
@@ -1194,7 +1198,8 @@ const opts = {
 
 const [command, ...rest] = positionals;
 try {
-  if (command === "run") await cmdRun(opts);
+  if (opts.version || command === "version") console.log(`claude-usage-ab ${describeHarness(harnessInfo(), { plain: true })}`);
+  else if (command === "run") await cmdRun(opts);
   else if (command === "watch") await cmdWatch(rest[0], opts);
   else if (command === "prepare") await cmdPrepare(rest[0], opts);
   else if (command === "probe") await cmdProbe(opts);
