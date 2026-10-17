@@ -10,7 +10,7 @@ It compares three ways of running the same Claude Code session:
 | `sdk-cli` | The same launch plus `-p` and no label, so the CLI labels itself. This is what `claude -p --input-format stream-json` does. | `sdk-cli` |
 | `claude-vscode` | The same launch with `CLAUDE_CODE_ENTRYPOINT=claude-vscode`, emulating the VS Code extension. | `claude-vscode` |
 
-Each run produces a Markdown report with a ready-to-paste issue comment. **Please contribute your reports**: results from many plans, models and machines are what make the answer convincing. See [CONTRIBUTING.md](CONTRIBUTING.md).
+Each run produces a Markdown report with a draft issue comment. **Please contribute your reports**: results from many plans, models and machines are what make the answer convincing. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Why the arms are comparable
 
@@ -103,7 +103,7 @@ The same works for any client that runs Claude Code in a folder, such as an Agen
 
 Every `run` and `watch` writes two files under `results/`, named with the UTC start time:
 
-- `results/2026-10-17T10-30-00Z-run.md`: the report. It has the result with confidence intervals, environment, method, how each arm was launched, token mix per arm, every block and caveats. It ends with an **issue comment** filled in from the results and linking to the report in this repository, ready to paste.
+- `results/2026-10-17T10-30-00Z-run.md`: the report. It has the result with confidence intervals, environment, method, how each arm was launched, token mix per arm, every block and caveats. It ends with a draft **issue comment** filled in from the results. The report is written before it is merged here, so the draft has no link to it yet; see [Posting to the issue](#posting-to-the-issue).
 - `results/2026-10-17T10-30-00Z-run.jsonl`: the raw data. Every turn and every block with both token counts and the meter readings, plus the run's metadata: versions, plan, model, meter at start and end, stop reason.
 
 Times are ISO 8601 with `-` in place of `:`, so they are valid file names everywhere. The generated corpus and Claude's stderr go to a temporary folder, not the repo.
@@ -117,6 +117,16 @@ node ab.mjs report results/<run>.jsonl results/<vscode-real>.jsonl   # writes re
 Runs on the same plan and model are pooled. Runs from different plans or models are not, because a point of the 5-hour window is a different number of tokens on each. The report then shows one row per run, each compared against its own slowest arm, and counts in how many runs each arm drained faster. Reports are never overwritten: every `report` call writes a new file.
 
 The report states which labels were set by this harness. Keep that line when you post the results.
+
+## Posting to the issue
+
+Once a report is merged into this repository, print its issue comment with a working link:
+
+```sh
+node ab.mjs comment results/2026-10-17T10-30-00Z-run.jsonl
+```
+
+It checks on GitHub which of the given reports are on `main` and links only those; the others are marked "not merged yet", with a note on stderr. Several runs can be given at once; runs from different plans or models then become one row each. The comment goes to stdout, so it can be piped, for example into `gh issue comment 97074 --repo anthropics/claude-code --body-file -`.
 
 ## Versions
 

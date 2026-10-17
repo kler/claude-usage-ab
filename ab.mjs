@@ -640,14 +640,40 @@ const armName = (a) => {
   return !labels || labels === a.name ? `\`${a.name}\`` : `\`${a.name}\` (\`${labels}\`)`;
 };
 
-/** A link to the report on GitHub once it is pushed, or to the repo when the report lives elsewhere. */
-function reportLink(file) {
-  const rel = file ? path.relative(REPO_DIR, file) : "..";
-  return rel.startsWith("..") || path.isAbsolute(rel) ? REPO_URL : `${REPO_URL}/blob/main/${rel.split(path.sep).join("/")}`;
+const RAW_MAIN_URL = "https://raw.githubusercontent.com/kler/claude-usage-ab/main";
+
+/** A run's report path inside this repository, or undefined when the run lives elsewhere. */
+function reportPath(run) {
+  const rel = path.relative(REPO_DIR, run.file.replace(/\.jsonl$/, ".md"));
+  return rel.startsWith("..") || path.isAbsolute(rel) ? undefined : rel.split(path.sep).join("/");
 }
 
+/** Links to the runs' reports, only for reports that are already on `main` on GitHub. */
+async function publishedLinks(runs) {
+  const links = new Map();
+  for (const run of runs) {
+    const rel = reportPath(run);
+    if (!rel) continue;
+    try {
+      const response = await fetch(`${RAW_MAIN_URL}/${rel}`, { method: "HEAD" });
+      if (response.ok) links.set(run.run, `${REPO_URL}/blob/main/${rel}`);
+    } catch {
+      // Offline or GitHub unreachable: leave the run unlinked.
+    }
+  }
+  return links;
+}
+
+const runRef = (run, links) => (links.has(run.run) ? `[${run.run}](${links.get(run.run)})` : `\`${run.run}\` (not merged yet)`);
+
+// Reports are written before their pull request exists, so their comment has no link yet.
+const COMMENT_NOTE = (runs) =>
+  `Ready to paste into the issue once this report is merged into ${REPO_URL}. Then \`node ab.mjs comment ${runs
+    .map((r) => (reportPath(r) ?? r.file).replace(/\.md$/, ".jsonl"))
+    .join(" ")}\` prints this comment with a link to the merged report.`;
+
 /** A comment for anthropics/claude-code#97074, filled in from this report's numbers. */
-function issueComment(runs, { arms, ref }, file) {
+function issueComment(runs, { arms, ref }, links = new Map()) {
   const m = runs.find((r) => r.meta.kind === "run")?.meta ?? runs[0].meta;
   const env = m.environment ?? {};
   const date = (m.startedAt ?? new Date().toISOString()).slice(0, 10);
@@ -677,13 +703,13 @@ function issueComment(runs, { arms, ref }, file) {
       (emulated.length ? ` ${emulated.join(", ")} had its label set by the harness through \`CLAUDE_CODE_ENTRYPOINT\`.` : "") +
       (real.length ? ` ${real.join(", ")} is the real client, driven by hand with the same prompts.` : ""),
     "",
-    `Full report with environment, token mix and every block: ${reportLink(file)}`,
+    `Full report${runs.length > 1 ? "s" : ""} with environment, token mix and every block: ${runs.map((r) => runRef(r, links)).join(", ")}`,
   );
   return lines.join("\n");
 }
 
 /** Markdown meant to be pasted into the issue: environment, method, results and per-block data. */
-function bugReport(runs, file) {
+function bugReport(runs) {
   const analysis = analyze(runs);
   const { arms, ref } = analysis;
   const out = [
@@ -785,10 +811,10 @@ function bugReport(runs, file) {
     "",
     "## Issue comment",
     "",
-    "Ready to paste into the issue:",
+    COMMENT_NOTE(runs),
     "",
     "```markdown",
-    issueComment(runs, analysis, file),
+    issueComment(runs, analysis),
     "```",
   );
   return out.join("\n");
@@ -822,7 +848,7 @@ const isComparable = (runs) => new Set(runs.map(runGroup).filter(Boolean)).size 
 const isTestOnly = (runs) => runs.every((r) => r.meta.test);
 
 /** Runs that cannot be pooled: one row per run, each arm compared with that run's own slowest arm. */
-function collectedReport(runs, file) {
+function collectedTable(runs, links = new Map()) {
   const rows = [];
   const tally = new Map();
   for (const run of runs.filter((r) => r.spans.length > 0)) {
@@ -830,33 +856,35 @@ function collectedReport(runs, file) {
     const m = run.meta;
     const others = arms.filter((a) => a.ratio);
     for (const a of others) {
-      const t = tally.get(a.name) ?? { runs: 0, faster: 0, ref: new Map() };
+      const t = tally.get(a.name) ?? { runs: 0, faster: 0 };
       t.runs++;
       if (!Number.isNaN(a.ratio.low) && a.ratio.low > 1) t.faster++;
-      t.ref.set(ref.name, (t.ref.get(ref.name) ?? 0) + 1);
       tally.set(a.name, t);
     }
     rows.push(
-      `| ${run.run} | ${describeHarness(m.harness)} | ${m.start?.subscription ?? "?"} | ${m.model ?? "set in client"} | ${m.environment?.claudeVersion ?? "?"} | \`${ref.name}\` | ${others.map((a) => `\`${a.name}\` ${fmtRatio(a.ratio)}`).join("; ") || "–"} |`,
+      `| ${links.has(run.run) ? runRef(run, links) : run.run} | ${describeHarness(m.harness)} | ${m.start?.subscription ?? "?"} | ${m.model ?? "set in client"} | ${m.environment?.claudeVersion ?? "?"} | \`${ref.name}\` | ${others.map((a) => `\`${a.name}\` ${fmtRatio(a.ratio)}`).join("; ") || "–"} |`,
     );
   }
-  const table = [
+  return [
     "| Run | claude-usage-ab | Plan | Model | Claude Code | Slowest arm (reference) | Other arms: drain the window faster by (95% CI) |",
     "|---|---|---|---|---|---|---|",
     ...rows,
+    "",
+    ...[...tally].map(([name, t]) => `- \`${name}\` drained the window clearly faster than the run's slowest arm in ${t.faster} of ${t.runs} runs.`),
   ];
-  const summary = [...tally].map(
-    ([name, t]) => `- \`${name}\` drained the window clearly faster than the run's slowest arm in ${t.faster} of ${t.runs} runs.`,
-  );
-  const comment = [
-    `Collected results from ${rows.length} runs of [claude-usage-ab](${REPO_URL}) across different plans or models. Each row compares the arms within one run.`,
+}
+
+function collectedComment(runs, links = new Map()) {
+  const unlinked = runs.filter((r) => r.spans.length > 0 && !links.has(r.run));
+  return [
+    `Collected results from ${runs.filter((r) => r.spans.length > 0).length} runs of [claude-usage-ab](${REPO_URL}) across different plans or models. Each row compares the arms within one run.`,
     "",
-    ...table,
-    "",
-    ...summary,
-    "",
-    `Full report: ${reportLink(file)}`,
-  ];
+    ...collectedTable(runs, links),
+    ...(unlinked.length ? ["", `Not merged yet, so not linked: ${unlinked.map((r) => `\`${r.run}\``).join(", ")}.`] : []),
+  ].join("\n");
+}
+
+function collectedReport(runs) {
   return [
     "# Claude Code plan usage by entrypoint: collected results",
     "",
@@ -864,30 +892,28 @@ function collectedReport(runs, file) {
     "",
     "These runs come from different plans or models. A point of the 5-hour window is a different number of tokens on each, so their blocks are not pooled. Each row is one run, with every arm compared against that run's slowest-draining arm. Each run's own report has the details.",
     "",
-    ...table,
-    "",
-    ...summary,
+    ...collectedTable(runs),
     "",
     "## Issue comment",
     "",
-    "Ready to paste into the issue:",
+    COMMENT_NOTE(runs),
     "",
     "```markdown",
-    ...comment,
+    collectedComment(runs),
     "```",
   ].join("\n");
 }
 
-function renderReport(runs, file) {
+function renderReport(runs) {
   if (isTestOnly(runs)) return { report: testReport(runs), pooled: false };
-  if (!isComparable(runs)) return { report: collectedReport(runs, file), pooled: false };
-  return { report: bugReport(runs, file), pooled: true };
+  if (!isComparable(runs)) return { report: collectedReport(runs), pooled: false };
+  return { report: bugReport(runs), pooled: true };
 }
 
 /** Writes the report to `file`; returns a short console summary. */
 function writeReport(file, runs) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const { report, pooled } = renderReport(runs, file);
+  const { report, pooled } = renderReport(runs);
   fs.writeFileSync(file, report + "\n");
   return pooled ? armTable(analyze(runs)) : report;
 }
@@ -1162,6 +1188,19 @@ function cmdReport(files, opts) {
   console.log(`Wrote ${file}`);
 }
 
+/** Prints the issue comment, linking only reports already merged on GitHub; notes go to stderr. */
+async function cmdComment(files) {
+  if (files.length === 0) throw new Abort("Usage: ab.mjs comment <results .jsonl files...>");
+  const runs = loadResults(files.map((f) => path.resolve(f)));
+  if (isTestOnly(runs)) throw new Abort("Test runs measure nothing, so they have no issue comment.");
+  const links = await publishedLinks(runs);
+  console.log(isComparable(runs) ? issueComment(runs, analyze(runs), links) : collectedComment(runs, links));
+  const unlinked = runs.filter((r) => !links.has(r.run)).map((r) => r.run);
+  if (unlinked.length) {
+    console.error(`\nNot on main at ${REPO_URL} yet, so not linked: ${unlinked.join(", ")}. Run this again once the pull request is merged.`);
+  }
+}
+
 const { values, positionals } = parseArgs({
   allowPositionals: true,
   options: {
@@ -1204,9 +1243,10 @@ try {
   else if (command === "prepare") await cmdPrepare(rest[0], opts);
   else if (command === "probe") await cmdProbe(opts);
   else if (command === "report") cmdReport(rest, opts);
+  else if (command === "comment") await cmdComment(rest);
   else {
     console.log(
-      "Commands: probe | run --model <id> [--test] | prepare <dir> | watch <dir> --label <client> | report <results .jsonl files...>\nCommands that spend usage ask for confirmation; --yes skips the question.",
+      "Commands: probe | run --model <id> [--test] | prepare <dir> | watch <dir> --label <client> | report <results .jsonl files...> | comment <results .jsonl files...>\nCommands that spend usage ask for confirmation; --yes skips the question.",
     );
     process.exitCode = 1;
   }

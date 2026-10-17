@@ -19,7 +19,7 @@ Real-client `watch` runs are welcome as well, for example the real VS Code exten
 
 Never edit or delete someone else's results. To correct a result, add a new run.
 
-Once your results are merged, you can paste the issue comment from your report into [anthropics/claude-code#97074](https://github.com/anthropics/claude-code/issues/97074). Its link points to your report in this repository.
+Once your results are merged, post them to [anthropics/claude-code#97074](https://github.com/anthropics/claude-code/issues/97074). `node ab.mjs comment results/<time>-run.jsonl` prints the comment with a link to your merged report; see [Posting to the issue](README.md#posting-to-the-issue). Don't post before the merge: the link would not work yet.
 
 ## Contribute code
 
@@ -128,3 +128,4 @@ The pull request updates by itself. Check its state with `gh pr view --repo kler
 - Ask whether the account was otherwise idle and put the answer in the pull request; don't assume it.
 - Commit only the run's `.md` and `.jsonl`. Never commit `test-results/`, and never change another contributor's results.
 - Open the pull request only when the person asks for it.
+- Posting to anthropics/claude-code#97074 is public and done in the person's name. Do it only when they ask, after the results are merged, and use the output of `node ab.mjs comment` unchanged.
