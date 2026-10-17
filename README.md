@@ -1,6 +1,6 @@
 # claude-usage-ab
 
-A test harness that measures whether Claude Code's 5-hour plan window drains faster per token depending on which client launched it. Background: [anthropics/claude-code#97074](https://github.com/anthropics/claude-code/issues/97074).
+A test harness that measures whether Claude Code's 5-hour plan window drains faster per token depending on which client launched it. Background: [anthropics/claude-code#97074](https://github.com/anthropics/claude-code/issues/97074). Repository: https://github.com/kler/claude-usage-ab
 
 It compares three ways of running the same Claude Code session:
 
@@ -73,7 +73,7 @@ Runs every arm for two short turns on a tiny corpus. It goes through the whole p
 | `--files`, `--lines` | `8`, `1000` | Corpus size, about 100k tokens of context. Larger means fewer, bigger turns per point (faster, coarser). Keep it well under the context window so auto-compaction never runs. |
 | `--max-util`, `--max-weekly` | `85`, `95` | Stop ceilings in percent. |
 | `--claude` | `claude` on PATH | The Claude Code binary every arm uses. |
-| `--out` | `results/<timestamp>-run` | Results folder. |
+| `--out` | `results/<timestamp>-run` | Results folder. A folder that already holds a run is refused. |
 | `--yes`, `-y` | off | Skip the confirmation question. |
 
 ## Checking against a real client
@@ -89,20 +89,28 @@ node ab.mjs watch ws-vscode --label vscode-real
 
 `watch` reads the meter every 15 seconds and the tokens from that workspace's transcripts. It records 1-point blocks the same way `run` does, and says when the budget is reached. Ctrl-C stops it early.
 
-The same works for any client that runs Claude Code in a folder. For example, open the folder as a project in T3 Code and use `--label t3-real`.
+The same works for any client that runs Claude Code in a folder, such as an Agent SDK app; give it its own `--label`.
 
 ## Reports
 
-Every `run` and `watch` folder contains:
+Every `run` and `watch` writes a folder under `results/` named with the UTC start time, for example `results/2026-10-17T10-30-00Z-run/`. Times use ISO 8601 with `-` in place of `:` so they are valid file names everywhere. The folder contains:
 
-- `report.md`: ready to paste into the issue. It has the result with confidence intervals, environment, method, how each arm was launched, token mix per arm, every block, and caveats.
+- `report-<time>.md`: the report for the issue. It has the result with confidence intervals, environment, method, how each arm was launched, token mix per arm, every block and caveats. At the end is an **issue comment** filled in from the results and linking to the report in this repository, ready to paste.
 - `samples.jsonl`: every turn and every block.
 - `meta.json`: versions, plan, meter readings at start and end, and the stop reason.
 
-To combine runs, for example a scripted run with the real-client checks:
+Reports are never overwritten. Each `report` call writes a new file with its own timestamp.
+
+To combine runs, for example a scripted run with real-client checks:
 
 ```sh
-node ab.mjs report results/<run> results/<vscode-real> results/<t3-real> --out combined.md
+node ab.mjs report results/<run> results/<vscode-real>   # writes reports/report-<time>.md
 ```
 
-The report states that non-default labels were set by this harness. Keep that line when you post the results.
+The report states which labels were set by this harness. Keep that line when you post the results.
+
+## Sharing results
+
+Results are meant to be committed, so the issue comment can link to them. Commit the run folder (and any combined report under `reports/`), then push before posting the comment. The generated corpus and `stderr.log` stay out of git.
+
+Committed files hold no names or home-directory paths, but your git commit records your git author identity.

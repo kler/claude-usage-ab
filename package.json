@@ -9,5 +9,10 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.276"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kler/claude-usage-ab.git"
+  },
+  "homepage": "https://github.com/kler/claude-usage-ab"
 }

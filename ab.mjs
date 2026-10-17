@@ -11,7 +11,7 @@ import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
-// Leaves the label unset so the Agent SDK applies its default, exactly as T3 Code does.
+// Leaves the label unset so the Agent SDK applies its default, as apps built on the SDK do.
 const ARM_SDK_DEFAULT = "sdk-ts";
 // Runs `claude -p` with no label, as the issue's reporters did; the CLI then labels itself.
 const ARM_PRINT_MODE = "sdk-cli";
@@ -24,7 +24,7 @@ const VSCODE_COMMON_ENV = {
   CLAUDE_CODE_EMIT_STARTUP_TIMING: "1",
 };
 
-// Inherited from a parent Claude, VS Code or T3 session, these would relabel the child process.
+// Inherited from a parent Claude Code or SDK app session, these would relabel the child process.
 const INHERITED_ENV_TO_DROP = [
   "CLAUDE_CODE_ENTRYPOINT",
   "CLAUDECODE",
@@ -38,7 +38,24 @@ const INHERITED_ENV_TO_DROP = [
 const COLORS = ["amber", "azure", "coral", "ivory", "jade", "lilac", "olive", "pearl", "rust", "slate", "teal", "umber"];
 const WORDS = ["ledger", "entry", "checked", "pending", "filed", "audit", "copy", "draft", "batch", "sealed", "noted", "stamped"];
 
+const REPO_URL = "https://github.com/kler/claude-usage-ab";
+const REPO_DIR = path.dirname(fileURLToPath(import.meta.url));
+// Inside the repo, so results can be committed and the generated issue comment can link to them.
+const RESULTS_DIR = path.join(REPO_DIR, "results");
+const REPORTS_DIR = path.join(REPO_DIR, "reports");
+
 class Abort extends Error {}
+
+/** ISO 8601 UTC to the second, with ":" as "-" so it is a valid file name on every OS. */
+const fileStamp = (date = new Date()) => date.toISOString().replace(/\.\d+Z$/, "Z").replaceAll(":", "-");
+
+/** Never overwrites: a name already taken (same second) gets a numeric suffix. */
+function freshPath(dir, base, ext) {
+  for (let n = 1; ; n++) {
+    const candidate = path.join(dir, `${base}${n === 1 ? "" : `-${n}`}${ext}`);
+    if (!fs.existsSync(candidate)) return candidate;
+  }
+}
 
 const emptyTokens = () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 const subtractTokens = (a, b) => ({
@@ -116,10 +133,13 @@ function claudeHome() {
   return process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude");
 }
 
+/** Results are committed, so paths drop the home directory, which names whoever ran the test. */
+const anonymizePath = (p) => (p && p.startsWith(os.homedir()) ? `~${p.slice(os.homedir().length)}` : p);
+
 function environmentInfo(claude) {
-  const sdkPackage = path.join(path.dirname(fileURLToPath(import.meta.url)), "node_modules/@anthropic-ai/claude-agent-sdk/package.json");
+  const sdkPackage = path.join(REPO_DIR, "node_modules/@anthropic-ai/claude-agent-sdk/package.json");
   return {
-    claudeBinary: claude,
+    claudeBinary: anonymizePath(claude),
     claudeVersion: claude ? execFileSync(claude, ["--version"], { encoding: "utf8" }).trim() : null,
     agentSdkVersion: fs.existsSync(sdkPackage) ? JSON.parse(fs.readFileSync(sdkPackage, "utf8")).version : null,
     node: process.version,
@@ -127,7 +147,7 @@ function environmentInfo(claude) {
   };
 }
 
-/** Streaming-input queue: the session stays open across turns, like T3 Code and the VS Code extension. */
+/** Streaming-input queue: the session stays open across turns, like SDK apps and the VS Code extension. */
 function makeInput() {
   const queue = [];
   let wake = null;
@@ -357,9 +377,11 @@ const fmtTokens = (n) => (Math.abs(n) >= 1e6 ? `${(n / 1e6).toFixed(2)}M` : `${(
 
 class Log {
   constructor(dir) {
-    fs.mkdirSync(dir, { recursive: true });
     this.dir = dir;
     this.file = path.join(dir, "samples.jsonl");
+    // Appending to an earlier run would mix two runs' data into one report.
+    if (fs.existsSync(this.file)) throw new Abort(`${dir} already holds a run. Choose a new --out.`);
+    fs.mkdirSync(dir, { recursive: true });
   }
   write(row) {
     fs.appendFileSync(this.file, JSON.stringify(row) + "\n");
@@ -511,11 +533,70 @@ const armMethod = (arm, sources) =>
     ? "A real client, driven by hand with the same prompts; tokens read from its transcripts."
     : (ARM_METHOD[arm] ?? `The same SDK launch with \`CLAUDE_CODE_ENTRYPOINT=${arm}\` set by this harness, emulating that client's label.`);
 
+const ARM_SHORT = {
+  [ARM_SDK_DEFAULT]: "Agent SDK, label left to the SDK",
+  [ARM_PRINT_MODE]: "`claude -p`, label chosen by the CLI",
+};
+const armShort = (arm, sources) =>
+  sources.includes("watch") ? "Real client, driven by hand" : (ARM_SHORT[arm] ?? "Agent SDK, label set by the harness");
+
+const armName = (a) => {
+  const labels = a.labels.join(", ");
+  return !labels || labels === a.name ? `\`${a.name}\`` : `\`${a.name}\` (\`${labels}\`)`;
+};
+
+/** A link to the report on GitHub once it is pushed, or to the repo when the report lives elsewhere. */
+function reportLink(file) {
+  const rel = file ? path.relative(REPO_DIR, file) : "..";
+  return rel.startsWith("..") || path.isAbsolute(rel) ? REPO_URL : `${REPO_URL}/blob/main/${rel.split(path.sep).join("/")}`;
+}
+
+/** A comment for anthropics/claude-code#97074, filled in from this report's numbers. */
+function issueComment(runs, { arms, ref }, file) {
+  const m = runs.find((r) => r.meta.kind === "run")?.meta ?? runs[0].meta;
+  const env = m.environment ?? {};
+  const date = (m.startedAt ?? new Date().toISOString()).slice(0, 10);
+  const lines = [
+    `Results from a controlled A/B run with [claude-usage-ab](${REPO_URL}) on ${date}: ${m.start?.subscription ?? "?"} plan, ${env.claudeVersion ?? "Claude Code ?"}, \`${m.model ?? "?"}\`${m.effort ? ` at ${m.effort} effort` : ""}.`,
+    "",
+    `| Entrypoint | Launched as | Blocks | Weighted tokens per 1% of the 5-hour window (95% CI) | Drains faster than \`${ref.name}\` by (95% CI) |`,
+    "|---|---|---|---|---|",
+  ];
+  for (const a of arms) {
+    lines.push(`| ${armName(a)} | ${armShort(a.name, a.sources)} | ${a.tokensPerPoint.n} | ${withCi(a.tokensPerPoint, fmtTokens)} | ${fmtRatio(a.ratio)} |`);
+  }
+  lines.push("");
+  for (const a of arms.filter((a) => a.ratio)) {
+    const clear = !Number.isNaN(a.ratio.low) && (a.ratio.low > 1 || a.ratio.high < 1);
+    lines.push(
+      clear
+        ? `- \`${a.name}\` used the 5-hour window **${a.ratio.value.toFixed(2)}x** as fast as \`${ref.name}\` for the same tokens.`
+        : `- \`${a.name}\` vs. \`${ref.name}\`: ${a.ratio.value.toFixed(2)}x, but the interval includes 1.0, so no clear difference.`,
+    );
+  }
+  const emulated = arms.filter((a) => !a.sources.includes("watch") && !(a.name in ARM_SHORT)).map((a) => `\`${a.name}\``);
+  const real = arms.filter((a) => a.sources.includes("watch")).map((a) => `\`${a.name}\``);
+  lines.push(
+    "",
+    `Method: every arm ran an identical workload (read a generated corpus once, then one-word questions, so mostly cache reads) with no user settings, hooks or MCP servers, on the same CLI binary. The 5-hour meter was read with the SDK's zero-token usage call, and usage was measured in chained ${m.points ?? 1}-point blocks with the arm order rotating.` +
+      (emulated.length ? ` ${emulated.join(", ")} had its label set by the harness through \`CLAUDE_CODE_ENTRYPOINT\`.` : "") +
+      (real.length ? ` ${real.join(", ")} is the real client, driven by hand with the same prompts.` : ""),
+    "",
+    `Full report with environment, token mix and every block: ${reportLink(file)}`,
+  );
+  return lines.join("\n");
+}
+
 /** Markdown meant to be pasted into the issue: environment, method, results and per-block data. */
-function bugReport(runs) {
+function bugReport(runs, file) {
   const analysis = analyze(runs);
   const { arms, ref } = analysis;
-  const out = ["# Claude Code plan usage by entrypoint: A/B results", ""];
+  const out = [
+    "# Claude Code plan usage by entrypoint: A/B results",
+    "",
+    `Generated ${new Date().toISOString()} by [claude-usage-ab](${REPO_URL}) for [anthropics/claude-code#97074](https://github.com/anthropics/claude-code/issues/97074).`,
+    "",
+  ];
   if (arms.length === 0) return out.concat("No complete measurements yet.").join("\n");
 
   out.push("## Result", "");
@@ -586,6 +667,14 @@ function bugReport(runs) {
     "- Other usage on the account during the run inflates whichever arm was running. The operator kept the account otherwise idle.",
     "",
     "Raw data: `samples.jsonl` (every turn and every block) and `meta.json` in each run folder.",
+    "",
+    "## Issue comment",
+    "",
+    "Ready to paste into the issue:",
+    "",
+    "```markdown",
+    issueComment(runs, analysis, file),
+    "```",
   );
   return out.join("\n");
 }
@@ -594,6 +683,8 @@ function bugReport(runs) {
 function testReport(runs) {
   const lines = [
     "# Harness test (not a measurement)",
+    "",
+    `Generated ${new Date().toISOString()} by [claude-usage-ab](${REPO_URL}).`,
     "",
     "Each arm ran two short turns on a tiny corpus. This checks that every arm starts, gets its expected label and is metered; it says nothing about relative usage.",
     "",
@@ -609,12 +700,15 @@ function testReport(runs) {
 }
 
 const isTestOnly = (runs) => runs.every((r) => r.meta.test);
-const renderReport = (runs) => (isTestOnly(runs) ? testReport(runs) : bugReport(runs));
+const renderReport = (runs, file) => (isTestOnly(runs) ? testReport(runs) : bugReport(runs, file));
 
-function writeReports(dir, runs) {
-  const report = renderReport(runs);
-  fs.writeFileSync(path.join(dir, "report.md"), report + "\n");
-  return isTestOnly(runs) ? report : armTable(analyze(runs));
+/** Writes a new timestamped report into `dir`; returns its path and a short console summary. */
+function writeReport(dir, runs) {
+  fs.mkdirSync(dir, { recursive: true });
+  const file = freshPath(dir, `report-${fileStamp()}`, ".md");
+  const report = renderReport(runs, file);
+  fs.writeFileSync(file, report + "\n");
+  return { file, summary: isTestOnly(runs) ? report : armTable(analyze(runs)) };
 }
 
 const rotate = (list, by) => [...list.slice(by % list.length), ...list.slice(0, by % list.length)];
@@ -625,7 +719,7 @@ async function cmdRun(opts) {
   const arms = opts.arms.split(",").map((s) => s.trim()).filter(Boolean);
   // A test run checks the whole harness on a tiny corpus, two turns per arm, without waiting for meter ticks.
   if (opts.test) Object.assign(opts, { files: 2, lines: 20 });
-  const out = path.resolve(opts.out ?? path.join("results", `${new Date().toISOString().replace(/[:.]/g, "-")}-${opts.test ? "test" : "run"}`));
+  const out = path.resolve(opts.out ?? path.join(RESULTS_DIR, `${fileStamp()}-${opts.test ? "test" : "run"}`));
   const probe = await openProbe(claude);
   try {
     const start = await readUsage(probe.q);
@@ -726,8 +820,8 @@ async function cmdRun(opts) {
       meta.finishedAt = new Date().toISOString();
       meta.end = await readUsage(probe.q).catch(() => null);
       log.meta(meta);
-      console.log("\n" + writeReports(out, loadResults([out])));
-      console.log(`\n${opts.test ? "Test report" : "Issue-ready report"}: ${path.join(out, "report.md")}`);
+      const { file, summary } = writeReport(out, loadResults([out]));
+      console.log(`\n${summary}\n\n${opts.test ? "Test report" : "Issue-ready report, including a comment to paste"}: ${file}`);
     }
   } finally {
     probe.close();
@@ -740,7 +834,7 @@ async function cmdWatch(workspace, opts) {
   // Claude Code stores a project's transcripts under its path with every non-alphanumeric character as "-".
   const projectDir = path.join(claudeHome(), "projects", abs.replace(/[^a-zA-Z0-9]/g, "-"));
   const label = opts.label ?? "manual";
-  const out = path.resolve(opts.out ?? path.join("results", `${new Date().toISOString().replace(/[:.]/g, "-")}-${label}`));
+  const out = path.resolve(opts.out ?? path.join(RESULTS_DIR, `${fileStamp()}-${label}`));
   const log = new Log(out);
   const claude = resolveClaude(opts.claude);
   const probe = await openProbe(claude);
@@ -800,8 +894,8 @@ async function cmdWatch(workspace, opts) {
     meta.end = await readUsage(probe.q).catch(() => null);
     probe.close();
     log.meta(meta);
-    console.log("\n" + writeReports(out, loadResults([out])));
-    console.log(`\nIssue-ready report: ${path.join(out, "report.md")}`);
+    const { file, summary } = writeReport(out, loadResults([out]));
+    console.log(`\n${summary}\n\nIssue-ready report, including a comment to paste: ${file}`);
   }
 }
 
@@ -823,15 +917,10 @@ async function cmdProbe(opts) {
 }
 
 function cmdReport(dirs, opts) {
-  if (dirs.length === 0) throw new Abort("Usage: ab.mjs report <result dirs...> [--out report.md]");
+  if (dirs.length === 0) throw new Abort("Usage: ab.mjs report <result dirs...> [--out <folder>]");
   const runs = loadResults(dirs.map((d) => path.resolve(d)));
-  const report = renderReport(runs);
-  if (opts.out) {
-    fs.writeFileSync(path.resolve(opts.out), report + "\n");
-    console.log(`Wrote ${path.resolve(opts.out)}`);
-  } else {
-    console.log(report);
-  }
+  const { file } = writeReport(path.resolve(opts.out ?? REPORTS_DIR), runs);
+  console.log(`Wrote ${file}`);
 }
 
 const { values, positionals } = parseArgs({
