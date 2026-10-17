@@ -1362,43 +1362,149 @@ async function cmdComment(files) {
   }
 }
 
-const { values, positionals } = parseArgs({
-  allowPositionals: true,
-  options: {
-    model: { type: "string" },
-    effort: { type: "string" },
-    arms: { type: "string", default: `${ARM_SDK_DEFAULT},${ARM_PRINT_MODE},claude-vscode` },
-    points: { type: "string", default: "2" },
-    rounds: { type: "string", default: "3" },
-    "max-util": { type: "string", default: "85" },
-    "max-weekly": { type: "string", default: "95" },
-    "max-turns": { type: "string", default: "400" },
-    files: { type: "string", default: "2" },
-    lines: { type: "string", default: "1000" },
-    interval: { type: "string", default: "15" },
-    claude: { type: "string" },
-    label: { type: "string" },
-    out: { type: "string" },
-    yes: { type: "boolean", short: "y", default: false },
-    version: { type: "boolean", short: "v", default: false },
-    test: { type: "boolean", default: false },
+const COMMANDS = {
+  probe: { usage: "probe", summary: "Show the account, plan and usage meters. Free." },
+  run: {
+    usage: "run --model <id> [options]",
+    summary: "Compare the arms on this account. Spends plan usage and asks first.",
+    detail:
+      "Runs a warm-up until the 5-hour meter next ticks, then --rounds rounds. Each round runs every arm once, in rotating order, and each of these blocks lasts until it has moved the meter by --points points. Before starting it shows the plan, the expected spend and where your meter should end up, and asks you to type yes. Writes results/<time>-run.md (the report) and .jsonl (the data).",
   },
-});
-const opts = {
-  ...values,
-  points: Number(values.points),
-  rounds: Number(values.rounds),
-  maxUtil: Number(values["max-util"]),
-  maxWeekly: Number(values["max-weekly"]),
-  maxTurns: Number(values["max-turns"]),
-  files: Number(values.files),
-  lines: Number(values.lines),
-  interval: Number(values.interval),
+  prepare: {
+    usage: "prepare <dir> [options]",
+    summary: "Create a workspace and prompts for measuring a real client by hand. Free.",
+  },
+  watch: {
+    usage: "watch <dir> --label <client> [options]",
+    summary: "Measure a real client while you send the prompts from <dir>/prompts.txt. Your prompts spend usage.",
+    detail:
+      "Reads the 5-hour meter every --interval seconds and the tokens from the client's transcripts for <dir>, and records --rounds blocks of --points points. Create <dir> with prepare first.",
+  },
+  report: {
+    usage: "report <results .jsonl files...> [--out <folder>]",
+    summary: "Write a report combining runs. Free.",
+    detail: "Pools runs that share plan, model and meter method; lists other runs one row each. Never overwrites: writes a new report-<time>.md.",
+  },
+  comment: {
+    usage: "comment <results .jsonl files...>",
+    summary: "Print the issue comment, linking only reports already merged on GitHub. Free.",
+  },
+  version: { usage: "version", summary: "Show this app's version and commit." },
 };
 
-const [command, ...rest] = positionals;
+/** Every option, with the commands it applies to; parsing, defaults and --help all come from here. */
+const OPTIONS = {
+  model: { type: "string", value: "<id>", for: ["run"], help: "Model for every arm, for example claude-opus-5-5 or claude-haiku-5-5. Required." },
+  effort: { type: "string", value: "<level>", for: ["run"], help: "low, medium, high, xhigh or max. Default: the CLI's default." },
+  test: { type: "boolean", for: ["run"], help: "Two short turns per arm on a tiny corpus: checks the setup, measures nothing. Writes to test-results/." },
+  arms: {
+    type: "string",
+    value: "<list>",
+    default: `${ARM_SDK_DEFAULT},${ARM_PRINT_MODE},claude-vscode`,
+    for: ["run"],
+    help: "Comma-separated arms to compare. Any other value is set as CLAUDE_CODE_ENTRYPOINT.",
+  },
+  rounds: { type: "string", value: "<n>", default: "3", number: true, for: ["run", "watch"], help: { run: "Rounds to measure; each runs every arm once.", watch: "Blocks to measure." } },
+  points: { type: "string", value: "<n>", default: "2", number: true, for: ["run", "watch"], help: "Meter points each block must move." },
+  files: { type: "string", value: "<n>", default: "2", number: true, for: ["run", "prepare"], help: "Files in the generated corpus." },
+  lines: { type: "string", value: "<n>", default: "1000", number: true, for: ["run", "prepare"], help: "Lines per corpus file." },
+  "max-turns": { type: "string", value: "<n>", default: "400", number: true, for: ["run", "prepare"], help: { run: "Turn limit per block.", prepare: "Questions to write to prompts.txt." } },
+  "max-util": { type: "string", value: "<pct>", default: "85", percent: true, for: ["run", "watch"], help: "Stop when the 5-hour meter reaches this." },
+  "max-weekly": { type: "string", value: "<pct>", default: "95", percent: true, for: ["run"], help: "Stop when the weekly meter reaches this." },
+  interval: { type: "string", value: "<s>", default: "15", number: true, for: ["watch"], help: "Seconds between meter readings." },
+  label: { type: "string", value: "<client>", for: ["watch"], help: "Name of the client being measured, for example vscode-real." },
+  claude: { type: "string", value: "<path>", for: ["run", "watch", "probe", "version"], help: "Claude Code binary to use. Default: claude on PATH." },
+  out: {
+    type: "string",
+    value: "<path>",
+    for: ["run", "watch", "report"],
+    help: { run: "Where to write the .md and .jsonl, without extension.", watch: "Where to write the .md and .jsonl, without extension.", report: "Folder for the report. Default: reports/." },
+  },
+  yes: { type: "boolean", short: "y", for: ["run"], help: "Start without asking. The spend is still shown." },
+  version: { type: "boolean", short: "v", help: "Show this app's version and commit." },
+  help: { type: "boolean", short: "h", help: "Show help." },
+};
+
+function help(command) {
+  const version = `claude-usage-ab ${describeHarness(harnessInfo(), { plain: true })}`;
+  const spec = COMMANDS[command];
+  if (!spec) {
+    const width = Math.max(...Object.keys(COMMANDS).map((c) => c.length));
+    return [
+      `${version}: measures whether Claude Code's 5-hour plan limit drains faster per token depending on the client that runs it.`,
+      "",
+      "Usage: node ab.mjs <command> [options]",
+      "",
+      "Commands:",
+      ...Object.entries(COMMANDS).map(([name, c]) => `  ${name.padEnd(width)}  ${c.summary}`),
+      "",
+      "Run node ab.mjs <command> --help for its options. Docs: README.md",
+    ].join("\n");
+  }
+  const options = Object.entries(OPTIONS).filter(([, o]) => o.for?.includes(command));
+  const flag = ([name, o]) => `${o.short ? `-${o.short}, ` : "    "}--${name}${o.value ? ` ${o.value}` : ""}`;
+  const width = Math.max(...options.map(flag).map((f) => f.length), 14);
+  const text = (o) => (typeof o.help === "string" ? o.help : o.help[command]) + (o.default ? ` Default: ${o.default}.` : "");
+  return [
+    `Usage: node ab.mjs ${spec.usage}`,
+    "",
+    spec.detail ?? spec.summary,
+    ...(options.length ? ["", "Options:", ...options.map((entry) => `  ${flag(entry).padEnd(width)}  ${text(entry[1])}`)] : []),
+    `  ${"-h, --help".padEnd(width)}  Show this help.`,
+  ].join("\n");
+}
+
+/** Parses the command line; mistakes come back as a short message that points to --help. */
+function parseCommandLine() {
+  let parsed;
+  try {
+    parsed = parseArgs({
+      allowPositionals: true,
+      tokens: true,
+      options: Object.fromEntries(
+        Object.entries(OPTIONS).map(([name, o]) => [
+          name,
+          { type: o.type, ...(o.short ? { short: o.short } : {}), ...(o.default ? { default: o.default } : {}) },
+        ]),
+      ),
+    });
+  } catch (error) {
+    const command = process.argv.slice(2).find((a) => !a.startsWith("-"));
+    throw new Abort(`${String(error.message).split(". ")[0]}. See node ab.mjs ${command && COMMANDS[command] ? `${command} ` : ""}--help.`);
+  }
+  const { values, positionals, tokens } = parsed;
+  const [command, ...rest] = positionals;
+  if (values.help || values.version) return { command, rest, values };
+  if (command && !COMMANDS[command]) throw new Abort(`Unknown command "${command}". See node ab.mjs --help.`);
+  for (const token of tokens.filter((t) => t.kind === "option")) {
+    const o = OPTIONS[token.name];
+    if (command && o.for && !o.for.includes(command)) {
+      throw new Abort(`--${token.name} does not apply to ${command}. See node ab.mjs ${command} --help.`);
+    }
+    if (o.number || o.percent) {
+      const n = Number(token.value);
+      const ok = Number.isInteger(n) && n > 0 && (!o.percent || n <= 100);
+      if (!ok) throw new Abort(`--${token.name} needs ${o.percent ? "a whole percentage from 1 to 100" : "a whole number above 0"}, not "${token.value}".`);
+    }
+  }
+  return { command, rest, values };
+}
+
 try {
-  if (opts.version || command === "version") console.log(`claude-usage-ab ${describeHarness(harnessInfo(), { plain: true })}`);
+  const { command, rest, values } = parseCommandLine();
+  const opts = {
+    ...values,
+    points: Number(values.points),
+    rounds: Number(values.rounds),
+    maxUtil: Number(values["max-util"]),
+    maxWeekly: Number(values["max-weekly"]),
+    maxTurns: Number(values["max-turns"]),
+    files: Number(values.files),
+    lines: Number(values.lines),
+    interval: Number(values.interval),
+  };
+  if (values.help) console.log(help(command));
+  else if (values.version || command === "version") console.log(`claude-usage-ab ${describeHarness(harnessInfo(), { plain: true })}`);
   else if (command === "run") await cmdRun(opts);
   else if (command === "watch") await cmdWatch(rest[0], opts);
   else if (command === "prepare") await cmdPrepare(rest[0], opts);
@@ -1406,9 +1512,7 @@ try {
   else if (command === "report") cmdReport(rest, opts);
   else if (command === "comment") await cmdComment(rest);
   else {
-    console.log(
-      "Commands: probe | run --model <id> [--test] | prepare <dir> | watch <dir> --label <client> | report <results .jsonl files...> | comment <results .jsonl files...>\nCommands that spend usage ask for confirmation; --yes skips the question.",
-    );
+    console.log(help());
     process.exitCode = 1;
   }
 } catch (error) {
