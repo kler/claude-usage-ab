@@ -57,3 +57,73 @@ git push --force-with-lease
 ```
 
 Keep each commit self-contained, with a short subject in the form `<type>: <summary>`. Types: `results`, `feat`, `fix`, `docs`.
+
+## Opening a pull request with `gh`
+
+Every command below runs without prompts, so people and agents can follow it as written. It assumes the [GitHub CLI](https://cli.github.com/) is installed and logged in (`gh auth status`).
+
+**1. Get a fork with the right remotes.** Pick the case that matches.
+
+```sh
+# No clone yet: forks, clones your fork as `origin`, and adds this repository as `upstream`.
+gh repo fork kler/claude-usage-ab --clone
+cd claude-usage-ab
+npm install
+
+# Already cloned this repository directly: forks it, renames the existing `origin` to `upstream`,
+# and adds your fork as `origin`.
+gh repo fork --remote
+```
+
+Check with `git remote -v`: `origin` must be your fork and `upstream` must be `kler/claude-usage-ab`.
+
+**2. Branch from the latest `main` and commit.** For a results pull request, commit only the run's two files:
+
+```sh
+git fetch upstream
+git switch -c results/2026-10-17T10-30-00Z upstream/main
+git add results/2026-10-17T10-30-00Z-run.md results/2026-10-17T10-30-00Z-run.jsonl
+git commit -m "results: team plan, claude-opus-5-5, Claude Code 2.1.301"
+git push -u origin HEAD
+```
+
+Take the plan, model and Claude Code version from the Environment table in the report.
+
+**3. Open the pull request.**
+
+```sh
+gh pr create \
+  --repo kler/claude-usage-ab \
+  --base main \
+  --head "$(gh api user --jq .login):$(git branch --show-current)" \
+  --title "results: team plan, claude-opus-5-5, Claude Code 2.1.301" \
+  --body-file - <<'EOF'
+Results: `results/2026-10-17T10-30-00Z-run.md`
+
+- Plan, model, effort: team, claude-opus-5-5, high
+- Claude Code: 2.1.301
+- Stop reason: budget measured
+- Account otherwise idle during the run: yes
+- Notes: none
+EOF
+```
+
+For a code change, use a `feat:`, `fix:` or `docs:` title and describe the change and how you checked it.
+
+**4. Update after review, or when `main` moves.** Never merge `main` into the branch:
+
+```sh
+git fetch upstream
+git rebase upstream/main
+git push --force-with-lease
+```
+
+The pull request updates by itself. Check its state with `gh pr view --repo kler/claude-usage-ab --web` or `gh pr checks --repo kler/claude-usage-ab`.
+
+### Notes for agents
+
+- `probe`, `prepare` and `report` are free. `run` (including `run --test`) and the prompts sent during `watch` spend the person's plan usage. Start them, and pass `--yes`, only after the person has explicitly agreed to that spend.
+- The meter covers the whole account. If you run on the same Claude account, your own turns are counted against whichever arm is running. Start a measurement and stay idle until it ends: don't poll it, or let the person start it.
+- Ask whether the account was otherwise idle and put the answer in the pull request; don't assume it.
+- Commit only the run's `.md` and `.jsonl`. Never commit `test-results/`, and never change another contributor's results.
+- Open the pull request only when the person asks for it.
