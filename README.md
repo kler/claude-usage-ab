@@ -29,19 +29,23 @@ The `claude-vscode` arm only emulates the label. A `watch` run of the real exten
 Each measurement pairs two numbers from two different sources:
 
 - **Tokens come from the client.** For scripted arms, the SDK's per-model usage for the session. As a cross-check, the session's transcript count is stored too: model calls the CLI makes without writing them to the transcript would show up as a gap. For `watch`, tokens come from the client's transcripts.
-- **Usage comes from the account.** The plan meter is the only place the account's response to those tokens can be seen, and it is account-wide: there is no per-session or per-client meter. After every turn, a fresh session that never sends a prompt reads it through the SDK's usage call, which costs no tokens. The meter value itself refreshes only about once a minute, and a long-lived session would add up to another minute of its own caching on top.
-- **Rate-limit events are logged too.** Every `rate_limit_event` the session receives is stored raw, as a candidate for a finer meter.
+- **Usage comes from the account.** The plan meter is the only place the account's response to those tokens can be seen, and it is account-wide: there is no per-session or per-client meter. The CLI reports the 5-hour utilization in a `rate_limit_event` whenever a request's response changes it, so every tick is placed at the request that caused it. Every event is stored raw.
+- **Why not the usage lookup.** The SDK's usage call (what `probe` shows) refreshes only about once a minute. Ending blocks on it credited up to a minute of one arm's usage to the next block, which made results noisy before 0.3.0. It is now only a fallback for CLIs that send no events, and the start and end readings. Older runs that logged events are recomputed from them when reported.
 
 Both are stored for every turn.
 
 **Blocks.**
 - A block runs one arm in a fresh session. The session reads a generated text corpus once, then answers one-word questions about it. Most of each turn's tokens are cache reads, as in real agent use.
-- A block lasts until the meter ticks `--points` past where the previous block ended (default 2). Because the meter refreshes about once a minute, a block lasts at least a minute; on a large model that can be several points. Blocks are chained back to back, so the tokens in a block bought exactly the points it moved, give or take one turn at each end. No usage is wasted waiting for a first tick, apart from one warm-up at the start.
+- A block lasts until the meter ticks `--points` past where the previous block ended (default 2). Blocks are chained back to back, so the tokens in a block bought exactly the points it moved, give or take one turn at each end. No usage is wasted waiting for a first tick, apart from one warm-up at the start.
 - The arm order rotates every round, so drift over time and the carry-over between neighbouring blocks affect every arm equally.
 
 **Metric.** Weighted tokens per point: `input + 1.25 × cache write + 0.1 × cache read + 5 × output`. The report also shows list-price dollars per point (the SDK's `total_cost_usd`), 95% confidence intervals per arm, and how many times faster each arm drains the window than the slowest one.
 
 **Statistics.** These come from repeated short blocks rather than one long run. The run measures whole rounds, one block per arm each, so every arm gets the same number of blocks. The default of 3 rounds is enough to separate a 2× effect. Raise `--rounds` to narrow the intervals.
+
+**Conclusion.** Every report starts with a plain-language conclusion, such as "`sdk-ts` and `sdk-cli` used up the 5-hour limit about 2.5× as fast as `claude-vscode` for the same work". An arm is called different only when its whole 95% interval is above 1; otherwise the conclusion says the data cannot tell yet, and which arm was least consistent.
+
+**Progress.** Before asking to start, `run` shows the plan: how many blocks, how many points it will spend and where your 5-hour meter should end up. While it runs, a status line shows the round, block, arm, turn, meter and the points the current block has moved so far; every finished block leaves a line with its result and what is left; every finished round prints the conclusion so far.
 
 ## Safety
 
@@ -95,7 +99,7 @@ node ab.mjs watch ws-vscode --label vscode-real
 2. Use the same model and effort as the scripted run. Turn off hooks and MCP servers.
 3. Send the prompts from `ws-vscode/prompts.txt` one at a time.
 
-`watch` reads the meter every 15 seconds and the tokens from that workspace's transcripts. It records blocks the same way `run` does, `--rounds` of them, and says when to stop. Ctrl-C stops it early.
+`watch` reads the meter every 15 seconds and the tokens from that workspace's transcripts. A real client's rate-limit events never reach its transcripts, so `watch` has to use the minute-refreshed usage lookup: its blocks are coarser, and it needs more of them for the same precision. It records blocks the same way `run` does, `--rounds` of them, and says when to stop. Ctrl-C stops it early.
 
 The same works for any client that runs Claude Code in a folder, such as an Agent SDK app; give it its own `--label`.
 
