@@ -1,5 +1,6 @@
 {
   "name": "claude-usage-ab",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "A/B test: does Claude Code's 5-hour usage window drain faster per token depending on the client entrypoint?",

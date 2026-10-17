@@ -3,7 +3,7 @@
 // Context: https://github.com/anthropics/claude-code/issues/97074. Usage: see README.md.
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { execFileSync, spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -154,6 +154,34 @@ function environmentInfo(claude) {
   };
 }
 
+// Recorded in every run: results from different meter methods are not comparable.
+const METER_METHOD = "fresh CLI session per reading";
+
+/**
+ * Which harness code produced a run. Results come from working copies too, so besides the version and
+ * commit this records whether the harness files had local changes, and a hash of the script that ran.
+ */
+function harnessInfo() {
+  const git = (...args) => {
+    try {
+      return execFileSync("git", args, { cwd: REPO_DIR, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    } catch {
+      return null;
+    }
+  };
+  const commit = git("rev-parse", "HEAD");
+  const changed = commit ? git("status", "--porcelain", "--", "ab.mjs", "package.json", "package-lock.json") : null;
+  return {
+    version: JSON.parse(fs.readFileSync(path.join(REPO_DIR, "package.json"), "utf8")).version,
+    commit,
+    modified: commit ? Boolean(changed) : null,
+    scriptSha256: createHash("sha256").update(fs.readFileSync(fileURLToPath(import.meta.url))).digest("hex"),
+  };
+}
+
+/** The command as typed, with home-directory paths shortened, so a report shows exactly how it was run. */
+const commandLine = () => ["node", "ab.mjs", ...process.argv.slice(2).map((a) => anonymizePath(a))].join(" ");
+
 /** Streaming-input queue: the session stays open across turns, like SDK apps and the VS Code extension. */
 function makeInput() {
   const queue = [];
@@ -250,6 +278,26 @@ async function openProbe(claude) {
   });
   const init = await q.initializationResult();
   return { q, account: init.account ?? {}, close: () => (input.end(), q.close()) };
+}
+
+/**
+ * Reads the plan meter. A CLI process caches its usage lookup for about a minute, so a long-lived
+ * session sees the meter jump once a minute; a fresh session per reading sees it as it moves.
+ */
+async function openMeter(claude) {
+  const probe = await openProbe(claude);
+  return {
+    account: probe.account,
+    async read() {
+      const fresh = await openProbe(claude);
+      try {
+        return await readUsage(fresh.q);
+      } finally {
+        fresh.close();
+      }
+    },
+    close: probe.close,
+  };
 }
 
 /** Who the CLI is logged in as. Shown before spending, never written to results, which get committed. */
@@ -420,7 +468,7 @@ class Log {
  * moved, give or take one turn at each end, and no usage is spent waiting for a first tick.
  */
 async function runBlock({ log, block, arm, target, ctx }) {
-  const { opts, probe, start, workspace, prompts, claude, stopped, stderrPath } = ctx;
+  const { opts, meter, start, workspace, prompts, claude, stopped, stderrPath } = ctx;
   const session = openSession({
     cwd: workspace,
     model: opts.model,
@@ -446,12 +494,12 @@ async function runBlock({ log, block, arm, target, ctx }) {
       sessionId = result.session_id;
       tokens = sumModelUsage(result.modelUsage);
       costUsd = result.total_cost_usd;
-      now = await readUsage(probe.q);
+      now = await meter.read();
       if (!sameWindow(start.fiveHourResetsAt, now.fiveHourResetsAt)) {
         throw new Abort("The 5-hour window reset during the run. Start a new run early in a fresh window.");
       }
       const weighted = weigh(tokens);
-      log.write({ kind: "sample", block, arm, turn, tokens, weighted, costUsd, fiveHour: now.fiveHour, sevenDay: now.sevenDay, at: new Date().toISOString() });
+      log.write({ kind: "sample", block, arm, turn, tokens, weighted, costUsd, fiveHour: now.fiveHour, sevenDay: now.sevenDay, limits, at: new Date().toISOString() });
       process.stdout.write(
         `\r[${block === 0 ? "warm-up" : `block ${block}`} ${arm}] turn ${turn}  5h ${now.fiveHour}% -> ${target}%  ${fmtTokens(weighted)} weighted  $${costUsd.toFixed(2)}   `,
       );
@@ -542,6 +590,18 @@ function analyze(runs) {
   return { arms, ref };
 }
 
+/** A run setting, read from `settings` or, for runs recorded before 0.2.0, from the old top-level fields. */
+const setting = (m, key) => m.settings?.[key] ?? m[key] ?? m.corpus?.[key];
+
+/** "0.2.0 @ abc1234", flagged when the harness had local changes; old runs predate versioning. */
+function describeHarness(h, { link = false } = {}) {
+  if (!h) return "unknown (recorded before 0.2.0)";
+  const short = h.commit ? h.commit.slice(0, 7) : "no git";
+  const commit = link && h.commit && !h.modified ? `[${short}](${REPO_URL}/commit/${h.commit})` : short;
+  const changes = h.modified ? `, **with local changes** (script sha256 ${h.scriptSha256.slice(0, 12)})` : "";
+  return `${h.version} @ ${commit}${changes}`;
+}
+
 const withCi = (s, fmt) => (Number.isNaN(s.half) ? fmt(s.mean) : `${fmt(s.mean)} ± ${fmt(s.half)}`);
 const fmtRatio = (r) => (r ? (Number.isNaN(r.low) ? `${r.value.toFixed(2)}x` : `${r.value.toFixed(2)}x (${r.low.toFixed(2)}–${r.high.toFixed(2)})`) : "reference");
 
@@ -592,7 +652,7 @@ function issueComment(runs, { arms, ref }, file) {
   const env = m.environment ?? {};
   const date = (m.startedAt ?? new Date().toISOString()).slice(0, 10);
   const lines = [
-    `Results from a controlled A/B run with [claude-usage-ab](${REPO_URL}) on ${date}: ${m.start?.subscription ?? "?"} plan, ${env.claudeVersion ?? "Claude Code ?"}, \`${m.model ?? "?"}\`${m.effort ? ` at ${m.effort} effort` : ""}.`,
+    `Results from a controlled A/B run with [claude-usage-ab](${REPO_URL}) ${describeHarness(m.harness, { link: true })} on ${date}: ${m.start?.subscription ?? "?"} plan, ${env.claudeVersion ?? "Claude Code ?"}, \`${m.model ?? "?"}\`${m.effort ? ` at ${m.effort} effort` : ""}.`,
     "",
     `| Entrypoint | Launched as | Blocks | Weighted tokens per 1% of the 5-hour window (95% CI) | Drains faster than \`${ref.name}\` by (95% CI) |`,
     "|---|---|---|---|---|",
@@ -613,7 +673,7 @@ function issueComment(runs, { arms, ref }, file) {
   const real = arms.filter((a) => a.sources.includes("watch")).map((a) => `\`${a.name}\``);
   lines.push(
     "",
-    `Method: every arm ran an identical workload (read a generated corpus once, then one-word questions, so mostly cache reads) with no user settings, hooks or MCP servers, on the same CLI binary. The 5-hour meter was read with the SDK's zero-token usage call, and usage was measured in chained ${m.points ?? 1}-point blocks with the arm order rotating.` +
+    `Method: every arm ran an identical workload (read a generated corpus once, then one-word questions, so mostly cache reads) with no user settings, hooks or MCP servers, on the same CLI binary. The 5-hour meter was read with the SDK's zero-token usage call (${m.meter ?? "long-lived CLI session, cached about 60 s"}), and usage was measured in chained ${setting(m, "points") ?? 1}-point blocks with the arm order rotating.` +
       (emulated.length ? ` ${emulated.join(", ")} had its label set by the harness through \`CLAUDE_CODE_ENTRYPOINT\`.` : "") +
       (real.length ? ` ${real.join(", ")} is the real client, driven by hand with the same prompts.` : ""),
     "",
@@ -641,6 +701,9 @@ function bugReport(runs, file) {
       `- \`${a.labels.join(", ") || a.name}\` used the 5-hour window **${a.ratio.value.toFixed(2)}x** as fast as \`${ref.labels.join(", ") || ref.name}\` per weighted token${Number.isNaN(a.ratio.low) ? "" : ` (95% CI ${a.ratio.low.toFixed(2)}–${a.ratio.high.toFixed(2)})`}.${clear ? "" : " The interval includes 1.0, so this difference is not established."}`,
     );
   }
+  if (arms.some((a) => a.tokensPerPoint.n < 2)) {
+    out.push("", "**Not conclusive:** at least one arm has fewer than two blocks, so there is no confidence interval. Run more rounds.");
+  }
   out.push("", armTable(analysis), "");
 
   out.push("## Environment", "", "| | |", "|---|---|");
@@ -649,6 +712,10 @@ function bugReport(runs, file) {
     const env = m.environment ?? {};
     out.push(
       `| Run \`${run.run}\` | ${m.kind ?? "?"}${m.label ? ` (${m.label})` : ""}, ${m.startedAt ?? "?"} → ${m.finishedAt ?? "?"} |`,
+      `| Harness | ${describeHarness(m.harness, { link: true })} |`,
+      `| Command | ${m.command ? `\`${m.command}\`` : "?"} |`,
+      `| Settings | ${m.settings ? Object.entries(m.settings).map(([k, v]) => `${k} ${Array.isArray(v) ? v.join(",") : v}`).join(", ") : "?"} |`,
+      `| Meter | ${m.meter ?? "long-lived CLI session (usage cached about 60 s)"} |`,
       `| Claude Code | ${env.claudeVersion ?? "?"} |`,
       `| Agent SDK | ${env.agentSdkVersion ?? "?"} |`,
       `| Plan | ${m.start?.subscription ?? "?"} |`,
@@ -664,11 +731,11 @@ function bugReport(runs, file) {
   out.push("", "## Method", "");
   out.push(
     "- Workload: a fresh session per block reads a generated text corpus" +
-      (scripted ? ` (${scripted.corpus.files} files × ${scripted.corpus.lines} lines)` : "") +
+      (scripted ? ` (${setting(scripted, "files")} files × ${setting(scripted, "lines")} lines)` : "") +
       " with the Read tool, then answers one-word questions about it without tools. Every arm sends identical prompts.",
     "- Isolation: no setting sources (no hooks, CLAUDE.md, plugins or MCP servers), claude.ai connectors off, same CLI binary for all scripted arms. Inherited `CLAUDE_CODE_ENTRYPOINT` and related variables are removed.",
-    "- Meter: the 5-hour utilization from the SDK's zero-token usage call, read after every turn by a separate session that never sends a prompt.",
-    `- Blocks: each block runs one arm until the meter ticks ${scripted?.points ?? 1} point(s) past the previous block's last tick. Blocks are chained, so the tokens in a block bought exactly the points it moved, ± one turn at each end. Arm order rotates every round. A warm-up up to the first tick is not counted.`,
+    "- Meter: the 5-hour utilization from the SDK's zero-token usage call, read after every turn by a session that never sends a prompt. From 0.2.0 that is a fresh CLI session per reading, because a CLI process caches the lookup for about a minute.",
+    `- Blocks: each block runs one arm until the meter ticks ${(scripted && setting(scripted, "points")) ?? 1} point(s) past the previous block's last tick. Blocks are chained, so the tokens in a block bought exactly the points it moved, ± one turn at each end. Arm order rotates every round. A warm-up up to the first tick is not counted.`,
     "- Tokens: weighted = input + 1.25 × cache write + 0.1 × cache read + 5 × output, from the SDK's per-model usage (scripted arms) or the session transcripts (manual arms). List-price $ is the SDK's `total_cost_usd`.",
     "- Guards: the run stops on any `rate_limit_event` with overage in use or a rejected status, at the configured 5-hour and weekly ceilings, or if the 5-hour window resets.",
     "",
@@ -707,6 +774,12 @@ function bugReport(runs, file) {
     "- Weighted tokens use list-price ratios. Metering may weight token types differently, but every arm runs the same mix.",
     "- Arms labelled by this harness only emulate the client's label; a `watch` run of the real client checks the emulation.",
     "- Other usage on the account during the run inflates whichever arm was running. The operator kept the account otherwise idle.",
+    ...(runs.some((r) => r.meta.harness?.modified)
+      ? ["- At least one run used a harness with local changes, so it cannot be reproduced exactly from a published version. Its script hash is in the Environment table."]
+      : []),
+    ...(runs.some((r) => !r.meta.meter)
+      ? ["- At least one run predates 0.2.0: it read the meter through a long-lived session whose usage lookup is cached for about a minute, so its blocks are much coarser."]
+      : []),
     "",
     "Raw data: the `.jsonl` file of each run, next to its report, with every turn, every block and the run's metadata.",
     "",
@@ -737,12 +810,14 @@ function testReport(runs) {
     lines.push(`| ${t.arm} | ${t.labels.join(", ") || "none"} | ${t.turns} | ${fmtTokens(weigh(t.tokens))} | ${t.costUsd.toFixed(3)} | ${t.fiveHour}% |`);
   }
   const m = runs[0]?.meta;
+  if (m) lines.push("", `Harness ${describeHarness(m.harness)}. Command: \`${m.command ?? "?"}\``);
   if (m?.start) lines.push("", `5-hour meter ${m.start.fiveHour}% → ${m.end?.fiveHour ?? "?"}%, weekly ${m.start.sevenDay}% → ${m.end?.sevenDay ?? "?"}%.`);
   return lines.join("\n");
 }
 
-/** A meter point is a different number of tokens on each plan and model, so only those runs can be pooled. */
-const runGroup = (r) => (r.meta.kind === "run" ? `${r.meta.start?.subscription ?? "?"} / ${r.meta.model ?? "?"}` : undefined);
+/** A meter point is a different number of tokens on each plan and model, and meter methods differ in resolution, so only runs that share all three are pooled. */
+const runGroup = (r) =>
+  r.meta.kind === "run" ? `${r.meta.start?.subscription ?? "?"} / ${r.meta.model ?? "?"} / ${r.meta.meter ?? "cached meter"}` : undefined;
 const isComparable = (runs) => new Set(runs.map(runGroup).filter(Boolean)).size <= 1;
 const isTestOnly = (runs) => runs.every((r) => r.meta.test);
 
@@ -762,12 +837,12 @@ function collectedReport(runs, file) {
       tally.set(a.name, t);
     }
     rows.push(
-      `| ${run.run} | ${m.start?.subscription ?? "?"} | ${m.model ?? "set in client"} | ${m.environment?.claudeVersion ?? "?"} | \`${ref.name}\` | ${others.map((a) => `\`${a.name}\` ${fmtRatio(a.ratio)}`).join("; ") || "–"} |`,
+      `| ${run.run} | ${describeHarness(m.harness)} | ${m.start?.subscription ?? "?"} | ${m.model ?? "set in client"} | ${m.environment?.claudeVersion ?? "?"} | \`${ref.name}\` | ${others.map((a) => `\`${a.name}\` ${fmtRatio(a.ratio)}`).join("; ") || "–"} |`,
     );
   }
   const table = [
-    "| Run | Plan | Model | Claude Code | Slowest arm (reference) | Other arms: drain the window faster by (95% CI) |",
-    "|---|---|---|---|---|---|",
+    "| Run | Harness | Plan | Model | Claude Code | Slowest arm (reference) | Other arms: drain the window faster by (95% CI) |",
+    "|---|---|---|---|---|---|---|",
     ...rows,
   ];
   const summary = [...tally].map(
@@ -826,12 +901,12 @@ async function cmdRun(opts) {
   // A test run checks the whole harness on a tiny corpus, two turns per arm, without waiting for meter ticks.
   if (opts.test) Object.assign(opts, { files: 2, lines: 20 });
   const base = opts.test ? resultsBase(opts.out, "test", TEST_RESULTS_DIR) : resultsBase(opts.out, "run");
-  const probe = await openProbe(claude);
+  const meter = await openMeter(claude);
   try {
-    const start = await readUsage(probe.q);
+    const start = await meter.read();
     const environment = environmentInfo(claude);
     const plan = [
-      `Account: ${describeAccount(probe.account)}, ${start.subscription ?? "unknown"} plan`,
+      `Account: ${describeAccount(meter.account)}, ${start.subscription ?? "unknown"} plan`,
       `Claude binary: ${claude} (${environment.claudeVersion})`,
       `Model: ${opts.model}${opts.effort ? ` at ${opts.effort} effort` : ""}`,
       ...(opts.test
@@ -841,13 +916,13 @@ async function cmdRun(opts) {
           ]
         : [
             `Arms, rotating order each round: ${arms.join(", ")}`,
-            `Blocks of ${opts.points} point(s) each until ${opts.budget} points are measured (${Math.ceil(opts.budget / opts.points / arms.length)} per arm).`,
-            `Spend: about ${opts.budget + 1} points of your 5-hour window (now ${start.fiveHour}%), and the matching share of your weekly limit (now ${start.sevenDay}%).`,
+            `${opts.rounds} rounds, each with one block of at least ${opts.points} point(s) per arm.`,
+            `Spend: depends on the plan and model; the run reports it after the warm-up and checks before every round that the round fits under --max-util. Your 5-hour window is at ${start.fiveHour}%, weekly at ${start.sevenDay}%.`,
             `Stops at ${opts.maxUtil}% (5-hour), ${opts.maxWeekly}% (weekly), on any sign of overage, or on Ctrl-C.`,
           ]),
       `Results: ${base}.md and ${base}.jsonl`,
     ];
-    const needed = opts.test ? 1 : opts.budget + 1;
+    const needed = opts.test ? 1 : 2 * arms.length;
     if (start.fiveHour + needed > opts.maxUtil) {
       throw new Abort(`Not enough room: ${start.fiveHour}% + ${needed} points would pass --max-util ${opts.maxUtil}%. Wait for the window to reset.`);
     }
@@ -864,13 +939,23 @@ async function cmdRun(opts) {
       kind: "run",
       test: opts.test,
       startedAt: new Date().toISOString(),
+      harness: harnessInfo(),
+      command: commandLine(),
+      settings: {
+        arms,
+        rounds: opts.rounds,
+        points: opts.points,
+        files: opts.files,
+        lines: opts.lines,
+        maxUtil: opts.maxUtil,
+        maxWeekly: opts.maxWeekly,
+        maxTurns: opts.maxTurns,
+        claude: anonymizePath(claude),
+      },
+      meter: METER_METHOD,
       environment,
       model: opts.model,
       effort: opts.effort ?? null,
-      arms,
-      points: opts.points,
-      budget: opts.budget,
-      corpus: { files: opts.files, lines: opts.lines },
       start,
       stopReason: "running",
     };
@@ -881,7 +966,7 @@ async function cmdRun(opts) {
       meta.stopReason = "interrupted";
       console.log("\nStopping after this turn...");
     });
-    const ctx = { opts, probe, start, workspace, claude, prompts, stderrPath, stopped: () => stop };
+    const ctx = { opts, meter, start, workspace, claude, prompts, stderrPath, stopped: () => stop };
     try {
       if (opts.test) {
         for (const arm of arms) {
@@ -903,9 +988,17 @@ async function cmdRun(opts) {
       let boundary = warmup.fiveHour;
       let measured = 0;
       let block = 0;
-      for (let round = 0; !stop && measured < opts.budget; round++) {
+      // Whole rounds only, so every arm gets the same number of blocks.
+      for (let round = 0; !stop && round < opts.rounds; round++) {
+        if (block > 0) {
+          const roundCost = (measured / block) * arms.length;
+          if (boundary + roundCost > opts.maxUtil) {
+            meta.stopReason = `another round (about ${Math.ceil(roundCost)} points) would pass --max-util ${opts.maxUtil}%`;
+            break;
+          }
+        }
         for (const arm of rotate(arms, round)) {
-          if (stop || measured >= opts.budget) break;
+          if (stop) break;
           block++;
           const result = await runBlock({ log, block, arm, target: boundary + opts.points, ctx });
           if (!result.reached) {
@@ -931,22 +1024,22 @@ async function cmdRun(opts) {
           if (result.fiveHour >= opts.maxUtil) (meta.stopReason = "5-hour ceiling reached"), (stop = true);
           if (result.sevenDay != null && result.sevenDay >= opts.maxWeekly) (meta.stopReason = "weekly ceiling reached"), (stop = true);
         }
-        console.log(`\nAfter round ${round + 1} (${measured}/${opts.budget} points measured):\n${armTable(analyze(loadResults([log.file])))}\n`);
+        console.log(`\nAfter round ${round + 1} of ${opts.rounds} (${measured} points measured):\n${armTable(analyze(loadResults([log.file])))}\n`);
       }
-      if (meta.stopReason === "running") meta.stopReason = "budget measured";
+      if (meta.stopReason === "running") meta.stopReason = "all rounds measured";
     } catch (error) {
       meta.stopReason = `error: ${error?.message ?? error}`;
       console.error(`Claude's stderr: ${stderrPath}`);
       throw error;
     } finally {
       meta.finishedAt = new Date().toISOString();
-      meta.end = await readUsage(probe.q).catch(() => null);
+      meta.end = await meter.read().catch(() => null);
       log.meta(meta);
       const summary = writeReport(log.report, loadResults([log.file]));
       console.log(`\n${summary}\n\n${opts.test ? "Test report" : "Issue-ready report, including a comment to paste"}: ${log.report}`);
     }
   } finally {
-    probe.close();
+    meter.close();
   }
 }
 
@@ -958,16 +1051,26 @@ async function cmdWatch(workspace, opts) {
   const label = opts.label ?? "manual";
   const log = new Log(resultsBase(opts.out, label));
   const claude = resolveClaude(opts.claude);
-  const probe = await openProbe(claude);
+  const meter = await openMeter(claude);
   const tokensNow = () => transcriptUsage(listJsonl(projectDir));
   let stop = false;
   process.once("SIGINT", () => (stop = true));
-  const meta = { kind: "watch", label, startedAt: new Date().toISOString(), environment: environmentInfo(claude), points: opts.points, budget: opts.budget, stopReason: "running" };
+  const meta = {
+    kind: "watch",
+    label,
+    startedAt: new Date().toISOString(),
+    harness: harnessInfo(),
+    command: commandLine(),
+    settings: { points: opts.points, blocks: opts.rounds, interval: opts.interval, maxUtil: opts.maxUtil },
+    meter: METER_METHOD,
+    environment: environmentInfo(claude),
+    stopReason: "running",
+  };
   try {
-    const start = await readUsage(probe.q);
+    const start = await meter.read();
     meta.start = start;
     log.meta(meta);
-    console.log(`Account: ${describeAccount(probe.account)}, ${start.subscription ?? "unknown"} plan`);
+    console.log(`Account: ${describeAccount(meter.account)}, ${start.subscription ?? "unknown"} plan`);
     console.log(`Watching ${projectDir}`);
     console.log(`5-hour window at ${start.fiveHour}%. Send the prompts from ${path.join(abs, "prompts.txt")} one at a time.`);
     console.log("Every prompt you send spends real plan usage. Ctrl-C stops watching and writes the report.");
@@ -976,9 +1079,9 @@ async function cmdWatch(workspace, opts) {
     let spanStart = emptyTokens();
     let measured = 0;
     let block = 0;
-    while (!stop && measured < opts.budget) {
+    while (!stop && block < opts.rounds) {
       await new Promise((resolve) => setTimeout(resolve, opts.interval * 1000));
-      const now = await readUsage(probe.q);
+      const now = await meter.read();
       if (!sameWindow(start.fiveHourResetsAt, now.fiveHourResetsAt)) throw new Abort("The 5-hour window reset. Start again.");
       const { total, entrypoints } = tokensNow();
       log.write({ kind: "sample", block, arm: label, tokens: total, weighted: weigh(total), fiveHour: now.fiveHour, sevenDay: now.sevenDay, at: new Date().toISOString() });
@@ -996,7 +1099,7 @@ async function cmdWatch(workspace, opts) {
         spanStart = total;
       }
       process.stdout.write(
-        `\r[${label}] 5h ${now.fiveHour}%  ${boundary === undefined ? "warming up to the first tick" : `${measured}/${opts.budget} points measured`}  labels: ${entrypoints.join(",") || "none yet"}   `,
+        `\r[${label}] 5h ${now.fiveHour}%  ${boundary === undefined ? "warming up to the first tick" : `${block}/${opts.rounds} blocks, ${measured} points measured`}  labels: ${entrypoints.join(",") || "none yet"}   `,
       );
       if (now.fiveHour >= opts.maxUtil) {
         meta.stopReason = "5-hour ceiling reached";
@@ -1004,8 +1107,8 @@ async function cmdWatch(workspace, opts) {
         break;
       }
     }
-    if (measured >= opts.budget) {
-      meta.stopReason = "budget measured";
+    if (block >= opts.rounds) {
+      meta.stopReason = "all blocks measured";
       console.log("\nBudget reached. Stop sending prompts.");
     } else if (stop) meta.stopReason = "interrupted";
   } catch (error) {
@@ -1013,8 +1116,8 @@ async function cmdWatch(workspace, opts) {
     throw error;
   } finally {
     meta.finishedAt = new Date().toISOString();
-    meta.end = await readUsage(probe.q).catch(() => null);
-    probe.close();
+    meta.end = await meter.read().catch(() => null);
+    meter.close();
     log.meta(meta);
     const summary = writeReport(log.report, loadResults([log.file]));
     console.log(`\n${summary}\n\nIssue-ready report, including a comment to paste: ${log.report}`);
@@ -1062,12 +1165,12 @@ const { values, positionals } = parseArgs({
     model: { type: "string" },
     effort: { type: "string" },
     arms: { type: "string", default: `${ARM_SDK_DEFAULT},${ARM_PRINT_MODE},claude-vscode` },
-    points: { type: "string", default: "1" },
-    budget: { type: "string", default: "9" },
+    points: { type: "string", default: "2" },
+    rounds: { type: "string", default: "3" },
     "max-util": { type: "string", default: "85" },
     "max-weekly": { type: "string", default: "95" },
     "max-turns": { type: "string", default: "400" },
-    files: { type: "string", default: "8" },
+    files: { type: "string", default: "2" },
     lines: { type: "string", default: "1000" },
     interval: { type: "string", default: "15" },
     claude: { type: "string" },
@@ -1080,7 +1183,7 @@ const { values, positionals } = parseArgs({
 const opts = {
   ...values,
   points: Number(values.points),
-  budget: Number(values.budget),
+  rounds: Number(values.rounds),
   maxUtil: Number(values["max-util"]),
   maxWeekly: Number(values["max-weekly"]),
   maxTurns: Number(values["max-turns"]),

@@ -5,7 +5,7 @@
 The most useful contribution is a report from your own account. One run says something about one plan, model and machine; many runs say whether the effect is general. Every report is welcome, including ones that show no difference.
 
 1. Follow [Use](README.md#use): `probe`, then `run --test`, then a real `run`. Keep the account otherwise idle while it runs.
-2. Check the report's environment table. The stop reason should be `budget measured`. If the run was interrupted or something else used the account, say so in the pull request, or run again.
+2. Run from an unmodified checkout of a commit on `main` when you can; the report shows the harness version and commit, and flags local changes. Check the report's environment table. The stop reason should be `all rounds measured`. If the run was interrupted or something else used the account, say so in the pull request, or run again.
 3. Commit the run's two files, and nothing from `test-results/`:
 
    ```sh
@@ -13,7 +13,7 @@ The most useful contribution is a report from your own account. One run says som
    git commit -m "results: team plan, claude-opus-5-5, Claude Code 2.1.301"
    ```
 
-4. Open a pull request (see [Workflow](#workflow)). In the description, mention anything unusual: other usage on the account, a different `--budget`, a custom `--claude` binary.
+4. Open a pull request (see [Workflow](#workflow)). In the description, mention anything unusual: other usage on the account, a different `--rounds`, a custom `--claude` binary.
 
 Real-client `watch` runs are welcome as well, for example the real VS Code extension next to a scripted run on the same plan and model.
 
@@ -27,6 +27,7 @@ Once your results are merged, you can paste the issue comment from your report i
 - Keep the harness small: one script, no build step, one dependency.
 - Check a change with `node ab.mjs run --test --model <small model>`, and with `node ab.mjs report` on existing results if it touches reporting.
 - If a change alters what a measurement means, say so in the pull request. Earlier results must stay readable.
+- Bump `version` in `package.json` when a change affects what is measured or how (workload, meter, metric, statistics). Patch-level changes (docs, report wording) can keep the version; the commit hash in every result still identifies them.
 
 ## Workflow
 
@@ -102,7 +103,7 @@ Results: `results/2026-10-17T10-30-00Z-run.md`
 
 - Plan, model, effort: team, claude-opus-5-5, high
 - Claude Code: 2.1.301
-- Stop reason: budget measured
+- Stop reason: all rounds measured
 - Account otherwise idle during the run: yes
 - Notes: none
 EOF

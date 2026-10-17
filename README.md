@@ -29,18 +29,19 @@ The `claude-vscode` arm only emulates the label. A `watch` run of the real exten
 Each measurement pairs two numbers from two different sources:
 
 - **Tokens come from the client.** For scripted arms, the SDK's per-model usage for the session. As a cross-check, the session's transcript count is stored too: model calls the CLI makes without writing them to the transcript would show up as a gap. For `watch`, tokens come from the client's transcripts.
-- **Usage comes from the account.** The plan meter is the only place the account's response to those tokens can be seen, and it is account-wide: there is no per-session or per-client meter. A separate session that never sends a prompt reads it after every turn through the SDK's usage call, which costs no tokens.
+- **Usage comes from the account.** The plan meter is the only place the account's response to those tokens can be seen, and it is account-wide: there is no per-session or per-client meter. After every turn, a fresh session that never sends a prompt reads it through the SDK's usage call, which costs no tokens. The meter value itself refreshes only about once a minute, and a long-lived session would add up to another minute of its own caching on top.
+- **Rate-limit events are logged too.** Every `rate_limit_event` the session receives is stored raw, as a candidate for a finer meter.
 
 Both are stored for every turn.
 
 **Blocks.**
 - A block runs one arm in a fresh session. The session reads a generated text corpus once, then answers one-word questions about it. Most of each turn's tokens are cache reads, as in real agent use.
-- A block lasts until the meter ticks `--points` past where the previous block ended (default 1). Blocks are chained back to back, so the tokens in a block bought exactly the points it moved, give or take one turn at each end. No usage is wasted waiting for a first tick, apart from one warm-up at the start.
+- A block lasts until the meter ticks `--points` past where the previous block ended (default 2). Because the meter refreshes about once a minute, a block lasts at least a minute; on a large model that can be several points. Blocks are chained back to back, so the tokens in a block bought exactly the points it moved, give or take one turn at each end. No usage is wasted waiting for a first tick, apart from one warm-up at the start.
 - The arm order rotates every round, so drift over time and the carry-over between neighbouring blocks affect every arm equally.
 
 **Metric.** Weighted tokens per point: `input + 1.25 × cache write + 0.1 × cache read + 5 × output`. The report also shows list-price dollars per point (the SDK's `total_cost_usd`), 95% confidence intervals per arm, and how many times faster each arm drains the window than the slowest one.
 
-**Statistics.** These come from repeated short blocks rather than one long run. The default measures 9 points, 3 blocks per arm, which is enough to separate a 2× effect and most smaller ones. Raise `--budget` to narrow the intervals.
+**Statistics.** These come from repeated short blocks rather than one long run. The run measures whole rounds, one block per arm each, so every arm gets the same number of blocks. The default of 3 rounds is enough to separate a 2× effect. Raise `--rounds` to narrow the intervals.
 
 ## Safety
 
@@ -57,7 +58,7 @@ Requires Node 20+ and a Claude Code login with a claude.ai subscription. Unset `
 npm install
 node ab.mjs probe                                      # account, plan and meter; costs nothing
 node ab.mjs run --test --model claude-haiku-5-5        # check everything works; a small fraction of a point
-node ab.mjs run --model claude-opus-5-5 --effort high  # the measurement; about --budget + 1 points
+node ab.mjs run --model claude-opus-5-5 --effort high  # the measurement; reports its cost per round after the warm-up
 ```
 
 `probe` shows which account the CLI is logged in as. If you use several accounts, run it first: the harness uses whatever account `claude` uses, including any `CLAUDE_CONFIG_DIR` you set.
@@ -75,9 +76,9 @@ Runs every arm for two short turns on a tiny corpus. It goes through the whole p
 | `--model` | (required) | Model for every arm. Use the one whose usage you care about. |
 | `--effort` | CLI default | Effort level for every arm. |
 | `--arms` | `sdk-ts,sdk-cli,claude-vscode` | Arms to compare. Any other value is set as `CLAUDE_CODE_ENTRYPOINT`. |
-| `--budget` | `9` | Meter points to measure, across all arms. The run spends about this plus 1. |
-| `--points` | `1` | Meter points per block. |
-| `--files`, `--lines` | `8`, `1000` | Corpus size, about 100k tokens of context. Larger means fewer, bigger turns per point (faster, coarser). Keep it well under the context window so auto-compaction never runs. |
+| `--rounds` | `3` | Rounds to measure; each runs one block per arm. Before each round the run checks it fits under `--max-util`. |
+| `--points` | `2` | Meter points per block. More points per block means less rounding error per block, at a higher cost. |
+| `--files`, `--lines` | `2`, `1000` | Corpus size, about 25k tokens. Each block is measured to within about one turn at each end, so smaller turns (a smaller corpus) give finer measurements; larger turns finish faster. Keep it well under the context window so auto-compaction never runs. |
 | `--max-util`, `--max-weekly` | `85`, `95` | Stop ceilings in percent. |
 | `--claude` | `claude` on PATH | The Claude Code binary every arm uses. |
 | `--out` | `results/<time>-run` | Where to write the run's `.jsonl` and `.md`, without extension. An existing run is refused. |
@@ -94,7 +95,7 @@ node ab.mjs watch ws-vscode --label vscode-real
 2. Use the same model and effort as the scripted run. Turn off hooks and MCP servers.
 3. Send the prompts from `ws-vscode/prompts.txt` one at a time.
 
-`watch` reads the meter every 15 seconds and the tokens from that workspace's transcripts. It records 1-point blocks the same way `run` does, and says when the budget is reached. Ctrl-C stops it early.
+`watch` reads the meter every 15 seconds and the tokens from that workspace's transcripts. It records blocks the same way `run` does, `--rounds` of them, and says when to stop. Ctrl-C stops it early.
 
 The same works for any client that runs Claude Code in a folder, such as an Agent SDK app; give it its own `--label`.
 
@@ -116,6 +117,10 @@ node ab.mjs report results/<run>.jsonl results/<vscode-real>.jsonl   # writes re
 Runs on the same plan and model are pooled. Runs from different plans or models are not, because a point of the 5-hour window is a different number of tokens on each. The report then shows one row per run, each compared against its own slowest arm, and counts in how many runs each arm drained faster. Reports are never overwritten: every `report` call writes a new file.
 
 The report states which labels were set by this harness. Keep that line when you post the results.
+
+## Versions
+
+Every result records how it was produced: the harness version (`package.json`), the git commit, whether the harness files had local changes (with a hash of the script that ran), the exact command, every setting including defaults, and the meter method. The report shows all of it. Runs recorded before 0.2.0 show the harness as unknown and are never pooled with later ones, because they read the meter through a long-lived session.
 
 ## Privacy
 
